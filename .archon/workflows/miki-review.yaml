@@ -113,16 +113,21 @@ nodes:
     context: fresh
 
   - id: human-review-gate
-    prompt: |
-      Present the review findings to the user before posting.
-
-      Show the synthesized review from $ARTIFACTS_DIR/review-summary.md.
-
-      Ask: "Want me to post these comments on the PR? You can also edit or remove any findings."
-
-      WAIT for approval. If user wants changes, update and ask again.
+    approval:
+      message: |
+        Code review ready for your review before posting to PR.
+        **Synthesized findings** → `$ARTIFACTS_DIR/review-summary.md`
+        **Individual comments** → `$ARTIFACTS_DIR/review-comments.md`
+        Review the findings above. Reply **approve** to post comments on the PR, or describe what to change/remove.
+      on_reject:
+        prompt: |
+          The reviewer wants changes to the review findings. Their feedback:
+          $human-review-gate.output
+          Read $ARTIFACTS_DIR/review-summary.md and $ARTIFACTS_DIR/review-comments.md.
+          Apply the requested changes, update both files.
+        max_attempts: 3
     depends_on: [synthesize]
-    interactive: true
+    idle_timeout: 600000
 
   - id: post-review
     prompt: |
