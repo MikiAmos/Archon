@@ -1,0 +1,447 @@
+name: miki-feature
+description: |
+  Use when: Implementing a new feature from a Linear issue, end-to-end.
+  Triggers: "build feature", "implement MIK-XXX", "start task", "new feature",
+            "implement this issue", "feature workflow".
+  NOT for: Bug fixes (use miki-bugfix), PR comment fixes (use miki-fix-pr-comments),
+           code reviews (use miki-review), architecture improvement (use miki-architecture).
+
+  Full lifecycle:
+  1. Fetch Linear issue details
+  2. Research & explore codebase (fresh session)
+  3. Conditional grill-me for complex/ambiguous tasks
+  4. Write implementation plan + context bundle (Opus)
+  5. Human approval gate
+  6. TDD implementation (fresh session, Sonnet)
+  7. Domain-specific review (py-review / ui-review)
+  8. Codex adversarial review (full diff, fresh model)
+  9. Human gate before commit
+  10. Commit, push, create PR, update Linear
+  11. Worktree cleanup with untracked file protection
+
+provider: claude
+model: sonnet
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: FETCH & CLASSIFY
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: extract-issue-id
+    prompt: |
+      Extract the Linear issue ID from the user request.
+
+      Request: $ARGUMENTS
+
+      Rules:
+      - Look for patterns like "MIK-XXX", "MIK XXX", "issue XXX", or just a number
+      - If ambiguous, use the Linear MCP to search for matching issues
+      - Output ONLY the issue identifier (e.g., MIK-200). No quotes, no markdown, no explanation.
+    model: haiku
+    allowed_tools: []
+
+  - id: fetch-issue
+    prompt: |
+      Fetch the full details of Linear issue $extract-issue-id.output.
+
+      Use the Linear MCP tool get_issue to retrieve:
+      - Title, description, acceptance criteria
+      - Priority, labels, status
+      - Any comments with context
+
+      Output a structured summary:
+      - TITLE: ...
+      - DESCRIPTION: ...
+      - ACCEPTANCE_CRITERIA: ...
+      - PRIORITY: ...
+      - LABELS: ...
+      - COMPLEXITY: LOW / MEDIUM / HIGH (your assessment based on scope)
+      - NEEDS_GRILLME: true/false (true if ambiguous, has open questions, or touches multiple systems)
+    depends_on: [extract-issue-id]
+    model: haiku
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: RESEARCH & EXPLORE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: research-explore
+    prompt: |
+      You are exploring a codebase to prepare for implementing a feature.
+
+      ## Issue
+      $fetch-issue.output
+
+      ## Instructions
+
+      1. Read CLAUDE.md to understand project conventions
+      2. Explore the codebase areas relevant to this issue:
+         - Find similar implementations (file:line references)
+         - Identify integration points
+         - Note patterns to follow (naming, error handling, testing)
+         - Check for existing utilities or services that can be reused
+      3. Read the architecture doc if referenced in CLAUDE.md
+      4. Check tasks/lessons.md for relevant gotchas
+
+      ## Output
+
+      Write your findings to $ARTIFACTS_DIR/research.md with sections:
+      - RELEVANT_FILES: file paths and why they matter
+      - PATTERNS_TO_FOLLOW: with code snippets
+      - INTEGRATION_POINTS: where new code connects
+      - GOTCHAS: things to watch out for
+      - DEPENDENCIES: what must exist before implementation
+    depends_on: [fetch-issue]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: GRILL-ME (CONDITIONAL)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: grill-me
+    prompt: |
+      You are a relentless design interviewer. The user wants to implement a feature
+      and there are open questions or ambiguity that must be resolved before planning.
+
+      ## Issue
+      $fetch-issue.output
+
+      ## Research Findings
+      Read $ARTIFACTS_DIR/research.md for codebase context.
+
+      ## Instructions
+
+      Interview the user about every aspect of this feature:
+      - Walk each branch of the design tree
+      - Challenge assumptions
+      - Ask about edge cases, failure modes, scale implications
+      - Resolve dependencies between decisions
+      - Don't stop until all ambiguity is resolved
+
+      Save the decisions and resolved questions to $ARTIFACTS_DIR/grill-me-decisions.md
+
+      IMPORTANT: This is an interactive node. Ask questions one at a time and wait
+      for user responses. When all questions are resolved, save the decisions file.
+    depends_on: [research-explore]
+    when: "$fetch-issue.output contains 'NEEDS_GRILLME: true'"
+    context: fresh
+    model: claude-opus-4-6
+    interactive: true
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: WRITE PLAN + CONTEXT BUNDLE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: write-plan
+    prompt: |
+      Create a self-contained implementation plan for this feature.
+
+      ## Issue
+      $fetch-issue.output
+
+      ## Research
+      Read $ARTIFACTS_DIR/research.md for codebase findings.
+
+      ## Grill-me Decisions (if exists)
+      Read $ARTIFACTS_DIR/grill-me-decisions.md if it exists for resolved questions.
+
+      ## Instructions
+
+      Produce TWO files:
+
+      ### 1. $ARTIFACTS_DIR/plan.md (lean, for human review)
+      - What to implement, in what order
+      - Task breakdown with acceptance criteria per task
+      - Testing strategy
+      - Scope boundaries (what we're NOT building)
+
+      ### 2. $ARTIFACTS_DIR/context-bundle.md (rich, for implementation session)
+      This file must answer three questions for the implementation agent:
+
+      **WHERE?**
+      - Exact file paths to create or modify
+      - Functions to change or extend
+      - How files connect to each other
+
+      **WHY THIS APPROACH?**
+      - Decisions made during research/grill-me and why
+      - Alternatives considered and rejected (with reasons)
+      - Architecture constraints that shaped the approach
+
+      **WATCH OUT FOR**
+      - Gotchas from tasks/lessons.md that apply
+      - Edge cases identified during research
+      - Patterns that MUST be followed (with code snippets)
+      - Known issues with dependencies or APIs
+
+      The context-bundle must be self-contained enough that an agent with no prior
+      context can start implementing immediately after reading it.
+    depends_on: [research-explore, grill-me]
+    trigger_rule: one_success
+    context: fresh
+    model: claude-opus-4-6
+
+  - id: human-approve-plan
+    prompt: |
+      Present the implementation plan to the user for approval.
+
+      Read and display $ARTIFACTS_DIR/plan.md.
+
+      Ask: "Does this plan look good? Any changes before we start implementation?"
+
+      WAIT for explicit approval ("approved", "lgtm", "looks good", "go", "yes").
+      If the user requests changes, update the plan and ask again.
+    depends_on: [write-plan]
+    interactive: true
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5: SETUP & IMPLEMENT
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: setup-branch
+    bash: |
+      ISSUE_ID=$(echo "$extract-issue-id.output" | tr -d "'\"\`\n " | grep -oE 'MIK-[0-9]+' | head -1)
+      if [ -z "$ISSUE_ID" ]; then
+        ISSUE_ID=$(echo "$extract-issue-id.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+        ISSUE_ID="MIK-$ISSUE_ID"
+      fi
+
+      # Read plan for branch name context
+      TITLE=$(head -5 "$ARTIFACTS_DIR/plan.md" | grep -i "feature\|title" | head -1 | sed 's/[^a-zA-Z0-9 ]//g' | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | cut -c1-40)
+      BRANCH="feature/$(echo $ISSUE_ID | tr '[:upper:]' '[:lower:]')-${TITLE:-implementation}"
+
+      git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+      echo "Branch: $BRANCH"
+      echo "Issue: $ISSUE_ID"
+    depends_on: [human-approve-plan]
+
+  - id: linear-in-progress
+    prompt: |
+      Update the Linear issue to "In Progress" and add a starting comment.
+
+      Issue: $extract-issue-id.output
+      Branch: $setup-branch.output
+
+      Use the Linear MCP tools:
+      1. save_issue to move state to "In Progress"
+      2. save_comment with: "🚀 Starting work. Branch: {branch name}"
+    depends_on: [setup-branch]
+    model: haiku
+
+  - id: tdd-implement
+    prompt: |
+      You are implementing a feature using strict Test-Driven Development.
+
+      ## Context
+      Read these files BEFORE writing any code:
+      1. $ARTIFACTS_DIR/plan.md — what to build
+      2. $ARTIFACTS_DIR/context-bundle.md — how to build it (files, patterns, gotchas)
+      3. CLAUDE.md — project conventions
+
+      ## TDD Rules (red-green-refactor)
+      For each task in the plan:
+      1. RED: Write a failing test first
+      2. GREEN: Write the minimum code to make it pass
+      3. REFACTOR: Clean up while keeping tests green
+      4. Run the full test suite after each task to catch regressions
+
+      ## Validation
+      After all tasks complete:
+      - Run full test suite (poetry run pytest for Python, npm test for frontend)
+      - Run linter (ruff check for Python, eslint for frontend)
+      - Verify no regressions
+
+      ## Output
+      Write implementation summary to $ARTIFACTS_DIR/implementation.md:
+      - Files created/modified
+      - Tests written and their status
+      - Any deviations from the plan (and why)
+    depends_on: [linear-in-progress]
+    context: fresh
+    model: sonnet
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 6: REVIEW CHAIN
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: domain-review
+    prompt: |
+      Run a domain-specific code review on all changes in this branch.
+
+      ## Instructions
+      1. Get the diff: `git diff $BASE_BRANCH...HEAD`
+      2. Identify file types:
+         - .py files → run py-review checklist (architecture, FastAPI, async, SQLAlchemy, security, testing, error handling, performance)
+         - .ts/.tsx/.vue/.js files → run ui-review checklist (component architecture, React patterns, TypeScript, state management, accessibility, styling, performance)
+      3. Review in REPORT mode first — categorize findings as Critical / Important / Minor / Style
+      4. AUTO-FIX any Critical and Important findings
+      5. Re-run tests after fixes to ensure no regressions
+
+      ## Output
+      Write review results to $ARTIFACTS_DIR/domain-review.md:
+      - Findings by severity with file:line references
+      - Fixes applied
+      - Test results after fixes
+    depends_on: [tdd-implement]
+    context: fresh
+
+  - id: codex-adversarial
+    prompt: |
+      Run Codex adversarial review on the full diff.
+
+      ## Instructions
+      1. Run: /codex:adversarial-review
+         - This sends the full branch diff to OpenAI's Codex for adversarial analysis
+         - It targets: auth gaps, data loss risks, race conditions, schema drift, observability gaps
+      2. If Codex is not available (plugin not installed), perform a manual adversarial review:
+         - Get full diff: `git diff $BASE_BRANCH...HEAD`
+         - Review with a "break confidence" mindset
+         - Target: security, failure modes, edge cases, design assumptions
+         - Be harsh — your job is to find problems, not validate the code
+
+      ## Critical Rule
+      If ANY finding is classified as CRITICAL severity:
+      - STOP the workflow
+      - Write findings to $ARTIFACTS_DIR/codex-review.md
+      - Report: "CRITICAL findings detected. Escalating to human review."
+      - Do NOT proceed to the next node
+
+      ## Output
+      Write to $ARTIFACTS_DIR/codex-review.md:
+      - All findings with severity and file:line
+      - PASS / FAIL verdict
+      - If FAIL with CRITICAL: include "WORKFLOW_STOP: true"
+    depends_on: [domain-review]
+    context: fresh
+
+  - id: check-codex-result
+    bash: |
+      if grep -q "WORKFLOW_STOP: true" "$ARTIFACTS_DIR/codex-review.md" 2>/dev/null; then
+        echo "CRITICAL findings detected — stopping for human review"
+        cat "$ARTIFACTS_DIR/codex-review.md"
+        exit 1
+      fi
+      echo "Review passed — proceeding to human gate"
+    depends_on: [codex-adversarial]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 7: HUMAN GATE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: human-gate
+    prompt: |
+      Present the implementation results for human approval before committing.
+
+      ## Show the user:
+      1. Git diff summary: `git diff --stat $BASE_BRANCH...HEAD`
+      2. Test results (run tests one more time)
+      3. Key findings from reviews:
+         - Read $ARTIFACTS_DIR/domain-review.md
+         - Read $ARTIFACTS_DIR/codex-review.md
+      4. Implementation summary from $ARTIFACTS_DIR/implementation.md
+
+      ## Ask:
+      "Ready to commit and push? Review the diff above and confirm."
+
+      WAIT for explicit approval. Do NOT commit without user saying
+      "approved", "lgtm", "looks good", "go", "yes", or "ship it".
+
+      If changes requested → fix → re-run tests → present again.
+    depends_on: [check-codex-result]
+    interactive: true
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 8: SHIP
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: commit-and-push
+    prompt: |
+      Commit all changes and push the branch.
+
+      ## Instructions
+      1. Stage all changes: `git add -A`
+      2. Create a conventional commit:
+         - feat: for new features
+         - Use the issue ID in the commit message
+         - Keep it concise but descriptive
+      3. Push: `git push -u origin HEAD`
+
+      ## Output
+      Report the commit hash and branch name.
+    depends_on: [human-gate]
+    model: haiku
+
+  - id: create-pr
+    prompt: |
+      Create a pull request for this branch.
+
+      ## Context
+      - Issue: $extract-issue-id.output
+      - Branch: $setup-branch.output
+      - Read $ARTIFACTS_DIR/plan.md for PR description context
+      - Read $ARTIFACTS_DIR/implementation.md for what was done
+      - Read $ARTIFACTS_DIR/domain-review.md for review summary
+
+      ## Instructions
+      1. Check for PR template at .github/pull_request_template.md
+      2. Create PR: `gh pr create --base $BASE_BRANCH`
+         - Title: concise, imperative mood, include issue ID
+         - Body: summary of changes, testing done, link to issue
+         - Include "Closes $extract-issue-id.output" for auto-close
+      3. Capture PR URL
+
+      ## Output
+      Report the PR URL.
+    depends_on: [commit-and-push]
+    context: fresh
+    model: haiku
+
+  - id: update-linear
+    prompt: |
+      Update the Linear issue to reflect PR creation.
+
+      Issue: $extract-issue-id.output
+
+      Use Linear MCP tools:
+      1. save_issue to move state to "In Review"
+      2. save_comment with: "🔍 PR created: {PR URL from create-pr output}. Ready for review."
+    depends_on: [create-pr]
+    model: haiku
+
+  - id: save-learnings
+    prompt: |
+      Run a session retrospective and save learnings.
+
+      ## Instructions
+      1. Review what happened during this workflow:
+         - Were there any surprises or gotchas?
+         - Did the plan need adjustment during implementation?
+         - Were there any test failures that revealed design issues?
+      2. If there are lessons worth capturing, append to tasks/lessons.md
+      3. Write a brief summary to $ARTIFACTS_DIR/retrospective.md
+
+      Keep it short — only capture things that would help future sessions.
+    depends_on: [update-linear]
+    context: fresh
+    model: haiku
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 9: CLEANUP
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: worktree-cleanup
+    prompt: |
+      Check for any untracked files in this worktree before cleanup.
+
+      ## Instructions
+      1. Run: `git status --porcelain`
+      2. If there are untracked files (lines starting with ??):
+         - List them for the user
+         - Ask: "These files aren't tracked by git. Want to copy any to the main working directory before cleanup?"
+         - Wait for user response
+         - Copy any requested files
+      3. If no untracked files: report "Worktree clean, ready for cleanup."
+
+      Note: Archon handles the actual worktree deletion — just handle the file check.
+    depends_on: [save-learnings]
+    interactive: true
+    model: haiku
