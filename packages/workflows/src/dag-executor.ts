@@ -251,7 +251,8 @@ async function resolveNodeProviderAndModel(
   workflowRunId: string,
   _cwd: string,
   workflowLevelOptions: WorkflowLevelOptions,
-  deps: WorkflowDeps
+  deps: WorkflowDeps,
+  mcpServers?: Record<string, unknown>
 ): Promise<{
   provider: 'claude' | 'codex';
   model: string | undefined;
@@ -291,7 +292,11 @@ async function resolveNodeProviderAndModel(
       node.allowed_tools !== undefined || node.denied_tools !== undefined,
     ],
     ['hooks', 'hooks', node.hooks !== undefined],
-    ['mcp', 'mcp', node.mcp !== undefined],
+    [
+      'mcp',
+      'mcp',
+      node.mcp !== undefined || (mcpServers !== undefined && Object.keys(mcpServers).length > 0),
+    ],
     ['skills', 'skills', node.skills !== undefined && node.skills.length > 0],
     ['effort', 'effortControl', (node.effort ?? workflowLevelOptions.effort) !== undefined],
     ['thinking', 'thinkingControl', (node.thinking ?? workflowLevelOptions.thinking) !== undefined],
@@ -362,6 +367,7 @@ async function resolveNodeProviderAndModel(
     ...baseOptions,
     nodeConfig,
     assistantConfig: assistantConfig as Record<string, unknown>,
+    ...(mcpServers && Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
   };
 
   return { provider, model, options };
@@ -1452,7 +1458,8 @@ async function executeLoopNode(
   nodeOutputs: Map<string, NodeOutput>,
   config: WorkflowConfig,
   issueContext?: string,
-  workflowLevelOptions?: WorkflowLevelOptions
+  workflowLevelOptions?: WorkflowLevelOptions,
+  mcpServers?: Record<string, unknown>
 ): Promise<NodeExecutionResult> {
   const loop = node.loop;
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -1565,6 +1572,7 @@ async function executeLoopNode(
       const iterationOptions: SendQueryOptions | undefined = {
         ...resolvedOptions,
         abortSignal: iterationAbortController.signal,
+        ...(mcpServers && Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
       };
 
       const generator = aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, iterationOptions);
@@ -1950,7 +1958,8 @@ async function executeApprovalNode(
   config: WorkflowConfig,
   workflowLevelOptions: WorkflowLevelOptions,
   configuredCommandFolder?: string,
-  issueContext?: string
+  issueContext?: string,
+  mcpServers?: Record<string, unknown>
 ): Promise<NodeOutput> {
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
 
@@ -2029,7 +2038,8 @@ async function executeApprovalNode(
       workflowRun.id,
       cwd,
       workflowLevelOptions,
-      deps
+      deps,
+      mcpServers
     );
 
     const output = await executeNodeInternal(
@@ -2119,7 +2129,8 @@ export async function executeDagWorkflow(
   config: WorkflowConfig,
   configuredCommandFolder?: string,
   issueContext?: string,
-  priorCompletedNodes?: Map<string, string>
+  priorCompletedNodes?: Map<string, string>,
+  mcpServers?: Record<string, unknown>
 ): Promise<string | undefined> {
   const dagStartTime = Date.now();
   const workflowLevelOptions = {
@@ -2390,7 +2401,8 @@ export async function executeDagWorkflow(
               nodeOutputs,
               config,
               issueContext,
-              workflowLevelOptions
+              workflowLevelOptions,
+              mcpServers
             );
             return { nodeId: node.id, output };
           }
@@ -2414,7 +2426,8 @@ export async function executeDagWorkflow(
               config,
               workflowLevelOptions,
               configuredCommandFolder,
-              issueContext
+              issueContext,
+              mcpServers
             );
             return { nodeId: node.id, output };
           }
@@ -2481,7 +2494,8 @@ export async function executeDagWorkflow(
             workflowRun.id,
             cwd,
             workflowLevelOptions,
-            deps
+            deps,
+            mcpServers
           );
 
           // 5. Determine session — parallel or context:fresh → always fresh

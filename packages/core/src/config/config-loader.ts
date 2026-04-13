@@ -400,6 +400,11 @@ function mergeRepoConfig(merged: MergedConfig, repo: RepoConfig): MergedConfig {
     result.envVars = { ...result.envVars, ...repo.env };
   }
 
+  // MCP overrides (auth headers, env for discovered servers)
+  if (repo.mcp?.overrides) {
+    result.mcpOverrides = repo.mcp.overrides;
+  }
+
   // Repo-level env-leak gate override (wins over global)
   if (repo.allow_target_repo_keys !== undefined) {
     result.allowTargetRepoKeys = repo.allow_target_repo_keys;

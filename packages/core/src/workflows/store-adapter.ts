@@ -12,6 +12,7 @@ import * as codebaseDb from '../db/codebases';
 import * as envVarDb from '../db/env-vars';
 import { getAgentProvider } from '@archon/providers';
 import { loadConfig as loadMergedConfig } from '../config/config-loader';
+import { discoverUserMcpServers } from '../mcp/discovery';
 import { createLogger } from '@archon/paths';
 
 // Compile-time assertion: MergedConfig must remain a structural subtype of WorkflowConfig.
@@ -71,5 +72,6 @@ export function createWorkflowDeps(): WorkflowDeps {
     store: createWorkflowStore(),
     getAgentProvider,
     loadConfig: loadMergedConfig,
+    discoverUserMcpServers,
   };
 }

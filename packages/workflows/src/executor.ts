@@ -14,6 +14,8 @@ import { logWorkflowStart, logWorkflowError } from './logger';
 import { getWorkflowEventEmitter } from './event-emitter';
 import { isClaudeModel, isModelCompatible } from './model-validation';
 import { classifyError } from './executor-shared';
+import { applyMcpOverrides, discoverProjectMcpServers, filterMcpServers } from './mcp/mcp-utils';
+import type { McpServerMap } from './mcp/mcp-utils';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -618,6 +620,28 @@ export async function executeWorkflow(
       // Continue anyway - workflow is already recorded in database
     }
 
+    // Discover and merge MCP servers (user plugins + project .mcp.json)
+    const userMcpServers = deps.discoverUserMcpServers ? await deps.discoverUserMcpServers() : {};
+    const projectMcpServers = await discoverProjectMcpServers(cwd);
+    let mergedMcpServers: McpServerMap = {
+      ...userMcpServers,
+      ...projectMcpServers,
+    };
+
+    // Apply auth overrides from config (headers/env injection)
+    if (config.mcpOverrides) {
+      mergedMcpServers = applyMcpOverrides(mergedMcpServers, config.mcpOverrides);
+    }
+
+    // Filter per workflow-level mcp_servers: { include?, exclude? }
+    const filteredMcpServers = workflow.mcp_servers
+      ? filterMcpServers(
+          mergedMcpServers,
+          workflow.mcp_servers.include,
+          workflow.mcp_servers.exclude
+        )
+      : mergedMcpServers;
+
     // Execute the DAG workflow
     const dagSummary = await executeDagWorkflow(
       deps,
@@ -635,7 +659,8 @@ export async function executeWorkflow(
       config,
       configuredCommandFolder,
       issueContext,
-      dagPriorCompletedNodes
+      dagPriorCompletedNodes,
+      filteredMcpServers
     );
 
     // executeDagWorkflow throws on fatal errors; check DB status for result

@@ -125,6 +125,10 @@ export interface SendQueryOptions extends AgentRequestOptions {
   nodeConfig?: NodeConfig;
   /** Per-provider defaults from .archon/config.yaml assistants section. */
   assistantConfig?: Record<string, unknown>;
+  /** Pre-resolved MCP server map from workflow-level discovery + merge + override + filter.
+   *  Providers use this directly instead of loading from file. Per-node `nodeConfig.mcp`
+   *  file servers merge on top (node wins). */
+  mcpServers?: Record<string, unknown>;
 }
 
 /**
