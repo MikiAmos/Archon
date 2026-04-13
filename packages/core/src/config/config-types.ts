@@ -169,6 +169,20 @@ export interface RepoConfig {
   allow_target_repo_keys?: boolean;
 
   /**
+   * MCP server configuration overrides.
+   * Inject auth headers or env vars into discovered MCP servers.
+   */
+  mcp?: {
+    overrides?: Record<
+      string,
+      {
+        headers?: Record<string, string>;
+        env?: Record<string, string>;
+      }
+    >;
+  };
+
+  /**
    * Default commands/workflows configuration
    */
   defaults?: {
@@ -258,6 +272,18 @@ export interface MergedConfig {
    * @default false
    */
   allowTargetRepoKeys: boolean;
+
+  /**
+   * MCP server auth overrides from repo config (mcp.overrides).
+   * Applied after merge, before filter — injects auth headers/env into discovered servers.
+   */
+  mcpOverrides?: Record<
+    string,
+    {
+      headers?: Record<string, string>;
+      env?: Record<string, string>;
+    }
+  >;
 }
 
 /**

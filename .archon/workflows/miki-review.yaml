@@ -1,0 +1,149 @@
+name: miki-review
+description: |
+  Use when: Reviewing someone else's PR or doing a standalone code review.
+  Triggers: "review this PR", "review PR #123", "code review", "check this PR",
+            "review changes".
+  NOT for: Fixing your own PR comments (use miki-fix-pr-comments),
+           implementing features (use miki-feature).
+
+  Lightweight workflow:
+  1. Fetch PR diff
+  2. Domain-specific review (py-review / ui-review)
+  3. Codex adversarial review (full diff)
+  4. Synthesize findings
+  5. Post review comments on PR
+
+provider: claude
+model: sonnet
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: FETCH
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: identify-pr
+    prompt: |
+      Identify the PR to review.
+
+      Request: $ARGUMENTS
+
+      Rules:
+      - Look for PR number, URL, or branch name
+      - If not specified, check current branch: `gh pr view --json number,url`
+      - Output: PR_NUMBER, PR_URL, BASE_BRANCH
+    model: haiku
+
+  - id: fetch-diff
+    bash: |
+      PR_NUM=$(echo "$identify-pr.output" | grep -oE '[0-9]+' | head -1)
+      gh pr diff "$PR_NUM" > "$ARTIFACTS_DIR/pr-diff.patch"
+      gh pr view "$PR_NUM" --json title,body,files,additions,deletions > "$ARTIFACTS_DIR/pr-metadata.json"
+      echo "PR #$PR_NUM diff saved ($(wc -l < "$ARTIFACTS_DIR/pr-diff.patch") lines)"
+    depends_on: [identify-pr]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: PARALLEL REVIEWS
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: domain-review
+    prompt: |
+      Run domain-specific code review on this PR.
+
+      Read the diff from $ARTIFACTS_DIR/pr-diff.patch
+      Read PR metadata from $ARTIFACTS_DIR/pr-metadata.json
+      Read CLAUDE.md for project conventions.
+
+      ## Instructions
+      1. Route by file type: .py → py-review checklist, .ts/.tsx/.vue → ui-review checklist
+      2. REPORT mode — findings only, no fixes (this is someone else's code)
+      3. Categorize: Critical / Important / Minor / Style
+      4. Include file:line references for every finding
+
+      Write to $ARTIFACTS_DIR/domain-review.md
+    depends_on: [fetch-diff]
+    context: fresh
+
+  - id: codex-adversarial
+    prompt: |
+      Run adversarial review on the PR diff.
+
+      Read $ARTIFACTS_DIR/pr-diff.patch
+
+      1. Run /codex:adversarial-review if available
+      2. Otherwise: review with "break confidence" mindset
+      3. Target: security, auth gaps, data loss, race conditions, performance
+
+      Write to $ARTIFACTS_DIR/codex-review.md
+    depends_on: [fetch-diff]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: SYNTHESIZE & POST
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: synthesize
+    prompt: |
+      Combine review findings into a single coherent review.
+
+      Read:
+      - $ARTIFACTS_DIR/domain-review.md
+      - $ARTIFACTS_DIR/codex-review.md
+
+      ## Instructions
+      1. Deduplicate findings (same issue found by both reviewers)
+      2. Prioritize by severity
+      3. Group by file
+      4. For each finding, provide:
+         - Severity (Critical / Important / Minor / Style)
+         - File and line
+         - Description
+         - Suggested fix (if applicable)
+
+      Write the synthesized review to $ARTIFACTS_DIR/review-summary.md
+
+      Also prepare individual PR comments — one per finding — ready to post.
+      Write these to $ARTIFACTS_DIR/review-comments.md in format:
+      ```
+      FILE: path/to/file
+      LINE: 42
+      BODY: The review comment text
+      ---
+      ```
+    depends_on: [domain-review, codex-adversarial]
+    context: fresh
+
+  - id: human-review-gate
+    approval:
+      message: |
+        Code review ready for your review before posting to PR.
+        **Synthesized findings** → `$ARTIFACTS_DIR/review-summary.md`
+        **Individual comments** → `$ARTIFACTS_DIR/review-comments.md`
+        Review the findings above. Reply **approve** to post comments on the PR, or describe what to change/remove.
+      on_reject:
+        prompt: |
+          The reviewer wants changes to the review findings. Their feedback:
+          $human-review-gate.output
+          Read $ARTIFACTS_DIR/review-summary.md and $ARTIFACTS_DIR/review-comments.md.
+          Apply the requested changes, update both files.
+        max_attempts: 3
+    depends_on: [synthesize]
+    idle_timeout: 600000
+
+  - id: post-review
+    prompt: |
+      Post review comments on the PR.
+
+      PR: $identify-pr.output
+      Read comments from $ARTIFACTS_DIR/review-comments.md
+
+      For inline comments, use:
+      `gh api repos/{owner}/{repo}/pulls/{PR_NUMBER}/comments --method POST`
+
+      For a general summary, use:
+      `gh pr review {PR_NUMBER} --comment --body "..."`
+
+      Post each finding as a separate inline comment on the relevant file:line.
+      End with a summary comment with the overall assessment.
+    depends_on: [human-review-gate]
+    context: fresh
+    model: haiku

@@ -379,11 +379,14 @@ async function applyNodeConfig(
     }
   }
 
-  // mcp → load config and set mcpServers + allowedTools wildcards
+  // mcp → load config and merge onto existing mcpServers (node file wins over workflow-level)
   if (nodeConfig.mcp) {
     const mcpPath = nodeConfig.mcp;
     const { servers, serverNames, missingVars } = await loadMcpConfig(mcpPath, cwd);
-    options.mcpServers = servers as Options['mcpServers'];
+    options.mcpServers = {
+      ...(options.mcpServers as Record<string, unknown> | undefined),
+      ...servers,
+    } as Options['mcpServers'];
     const mcpWildcards = serverNames.map(name => `mcp__${name}__*`);
     options.allowedTools = [...(options.allowedTools ?? []), ...mcpWildcards];
     getLog().info({ serverNames, mcpPath }, 'claude.mcp_config_loaded');
@@ -650,6 +653,18 @@ export class ClaudeProvider implements IAgentProvider {
           }
         },
       };
+
+      // Apply workflow-level MCP servers (discovered + merged + overridden + filtered)
+      if (requestOptions?.mcpServers && Object.keys(requestOptions.mcpServers).length > 0) {
+        options.mcpServers = requestOptions.mcpServers as Options['mcpServers'];
+        const serverNames = Object.keys(requestOptions.mcpServers);
+        const mcpWildcards = serverNames.map(name => `mcp__${name}__*`);
+        options.allowedTools = [...(options.allowedTools ?? []), ...mcpWildcards];
+        getLog().info(
+          { serverNames, source: 'workflow-passthrough' },
+          'claude.mcp_servers_injected'
+        );
+      }
 
       // Apply nodeConfig if present (workflow path) — translates YAML to SDK options
       const nodeConfigWarnings: string[] = [];

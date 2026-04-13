@@ -1,0 +1,173 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+  issue_comment:
+    types: [created]
+
+jobs:
+  set-pending:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - name: Set pending status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "${{ github.event.action }}" = "opened" ]; then
+            DESC="Waiting for /review command"
+          else
+            DESC="New commits pushed - run /review again"
+          fi
+
+          gh api "repos/$REPO/statuses/$HEAD_SHA" \
+            --method POST \
+            -f state="pending" \
+            -f description="$DESC" \
+            -f context="claude-review"
+
+  review:
+    if: |
+      github.event_name == 'issue_comment' &&
+      startsWith(github.event.comment.body, '/review') &&
+      github.event.comment.user.login == 'MikiAmos' &&
+      github.event.issue.pull_request != null
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Claude review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          HEAD_SHA=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha')
+
+          # React with eyes on the /review comment
+          TRIGGER_COMMENT_ID=${{ github.event.comment.id }}
+          gh api "repos/$REPO/issues/comments/$TRIGGER_COMMENT_ID/reactions" \
+            --method POST -f content="eyes"
+
+          # Fetch PR head to get CLAUDE.md from the PR branch
+          git fetch origin "$HEAD_SHA" --depth=1
+          git checkout "$HEAD_SHA" -- CLAUDE.md 2>/dev/null || true
+
+          # Signal review is running
+          gh api "repos/$REPO/statuses/$HEAD_SHA" \
+            --method POST \
+            -f state="pending" \
+            -f description="Claude review in progress..." \
+            -f context="claude-review"
+
+          # Get diff (truncated to 2000 lines — Archon PRs can be large)
+          PR_DIFF=$(gh pr diff "$PR_NUMBER" | head -n 2000)
+          PR_FILES=$(gh pr diff "$PR_NUMBER" --name-only)
+
+          PROMPT=$(cat << 'ENDPROMPT'
+          You are a senior code reviewer for Archon — a workflow orchestration engine built with Bun, TypeScript, and the Claude Code SDK.
+
+          Architecture context:
+          - Monorepo: @archon/core (orchestration, clients, config), @archon/workflows (DAG executor, schemas), @archon/isolation (worktrees), @archon/git, @archon/paths
+          - Dependency direction: @archon/core depends on @archon/workflows (not the reverse)
+          - Runtime: Bun (not Node) — use Bun.Glob, bun:test, etc.
+          - Tests: bun:test with describe/test/expect (not jest/vitest)
+          - Validation: Zod schemas
+
+          Review focus:
+          - Logic bugs, especially in DAG execution flow and async handling
+          - Package boundary violations (workflows must not import from core)
+          - Security: env var leakage, path traversal in worktree operations
+          - Type safety: proper discriminated unions, no unsafe casts
+          - Error handling: errors must be wrapped with context, never swallowed
+          - MCP server config handling: correct format parsing, env var resolution
+
+          Do NOT review: style, linting, formatting, naming conventions — those are handled by automated tools.
+
+          If the code is good to merge:
+          - Write 2-3 lines of code-level observations (not a summary of what the PR does)
+          - End with: MERGE_DECISION: APPROVED
+
+          If the code has issues that must be fixed before merging:
+          - List all blocking issues with file:line references and what to fix
+          - List all non-blocking suggestions
+          - End with: MERGE_DECISION: CHANGES_REQUESTED
+
+          You have full autonomy on the merge decision. Only block if there is a real reason.
+          ENDPROMPT
+          )
+
+          # Extract project context from CLAUDE.md markers
+          CONTEXT_BLOCK=""
+          if [ -f "CLAUDE.md" ]; then
+            EXTRACTED=$(sed -n '/<!-- review-context-start -->/,/<!-- review-context-end -->/p' CLAUDE.md \
+              | grep -v '<!-- review-context-start -->' \
+              | grep -v '<!-- review-context-end -->')
+            if [ -n "$EXTRACTED" ]; then
+              CONTEXT_BLOCK=$(printf '\n\nProject context:\n%s' "$EXTRACTED")
+            fi
+          fi
+
+          FULL_PROMPT=$(printf '%s%s\n\nChanged files:\n%s\n\nDiff:\n%s' \
+            "$PROMPT" "$CONTEXT_BLOCK" "$PR_FILES" "$PR_DIFF")
+
+          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "$(jq -n \
+              --arg prompt "$FULL_PROMPT" \
+              '{
+                model: "claude-sonnet-4-6",
+                max_tokens: 4096,
+                messages: [{"role": "user", "content": $prompt}]
+              }'
+            )")
+
+          REVIEW=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
+
+          if [ -n "$REVIEW" ]; then
+            printf '%s' "$REVIEW" > /tmp/review.md
+            gh pr comment "$PR_NUMBER" --body-file /tmp/review.md
+
+            COMMENT_ID=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --jq '.[-1].id')
+
+            if echo "$REVIEW" | grep -qF "MERGE_DECISION: APPROVED"; then
+              STATUS_STATE="success"
+              STATUS_DESC="Claude review: approved"
+              gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions" \
+                --method POST -f content="rocket"
+            elif echo "$REVIEW" | grep -qF "MERGE_DECISION: CHANGES_REQUESTED"; then
+              STATUS_STATE="failure"
+              STATUS_DESC="Claude review: changes requested"
+              gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions" \
+                --method POST -f content="-1"
+            else
+              STATUS_STATE="failure"
+              STATUS_DESC="Claude review: no verdict found - merge blocked"
+              gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions" \
+                --method POST -f content="confused"
+            fi
+          else
+            echo "::warning::Claude API returned empty response"
+            echo "$RESPONSE" | jq .
+            STATUS_STATE="failure"
+            STATUS_DESC="Claude review: error - check workflow logs"
+          fi
+
+          gh api "repos/$REPO/statuses/$HEAD_SHA" \
+            --method POST \
+            -f state="$STATUS_STATE" \
+            -f description="$STATUS_DESC" \
+            -f context="claude-review"

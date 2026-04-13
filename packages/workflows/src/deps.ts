@@ -9,6 +9,7 @@
  */
 import type { IWorkflowStore } from './store';
 import type { ModelReasoningEffort, WebSearchMode } from './schemas';
+import type { McpServerMap } from './mcp/mcp-utils';
 import type {
   IAgentProvider,
   MessageChunk,
@@ -90,6 +91,15 @@ export interface WorkflowConfig {
       additionalDirectories?: string[];
     };
   };
+  /** MCP server auth overrides from repo config (mcp.overrides).
+   *  Applied after merge, before filter — injects auth headers/env into discovered servers. */
+  mcpOverrides?: Record<
+    string,
+    {
+      headers?: Record<string, string>;
+      env?: Record<string, string>;
+    }
+  >;
 }
 
 // ---------------------------------------------------------------------------
@@ -106,4 +116,7 @@ export interface WorkflowDeps {
   store: IWorkflowStore;
   getAgentProvider: AgentProviderFactory;
   loadConfig: (cwd: string) => Promise<WorkflowConfig>;
+  /** Discover MCP servers from the user's Claude Code plugins.
+   *  Optional — when absent, no user plugin servers are injected. */
+  discoverUserMcpServers?: () => Promise<McpServerMap>;
 }
