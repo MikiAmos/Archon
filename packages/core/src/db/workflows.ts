@@ -169,14 +169,22 @@ export async function getActiveWorkflowRun(conversationId: string): Promise<Work
  */
 export async function getPausedWorkflowRun(conversationId: string): Promise<WorkflowRun | null> {
   try {
+    // Match 'paused' (normal) or 'failed' (recovery after server restart race).
+    // The approval metadata check in TypeScript below distinguishes "failed at approval gate"
+    // from "genuinely failed" — only runs with approval context are returned.
     const result = await pool.query<WorkflowRun>(
       `SELECT * FROM remote_agent_workflow_runs
-       WHERE (conversation_id = $1 OR parent_conversation_id = $2) AND status = 'paused'
+       WHERE (conversation_id = $1 OR parent_conversation_id = $2)
+         AND status IN ('paused', 'failed')
        ORDER BY started_at DESC LIMIT 1`,
       [conversationId, conversationId]
     );
     const row = result.rows[0];
-    return row ? normalizeWorkflowRun(row) : null;
+    if (!row) return null;
+    const run = normalizeWorkflowRun(row);
+    // For 'failed' runs, only return if they have approval metadata (failed at gate, not genuinely failed)
+    if (run.status === 'failed' && !run.metadata?.approval) return null;
+    return run;
   } catch (error) {
     const err = error as Error;
     getLog().error({ err, conversationId }, 'db.workflow_run_get_paused_failed');
@@ -522,12 +530,12 @@ export async function pauseWorkflowRun(
     const result = await pool.query(
       `UPDATE remote_agent_workflow_runs
        SET status = 'paused', metadata = ${dialect.jsonMerge('metadata', 2)}
-       WHERE id = $1 AND status = 'running'`,
+       WHERE id = $1 AND status IN ('running', 'failed')`,
       [id, JSON.stringify({ approval: approvalContext })]
     );
     if (result.rowCount === 0) {
       getLog().warn({ workflowRunId: id }, 'db.workflow_run_pause_no_match');
-      throw new Error(`Workflow run not found or not in running state (id: ${id})`);
+      throw new Error(`Workflow run not found or not in running/failed state (id: ${id})`);
     }
   } catch (error) {
     if (error instanceof Error && error.message.startsWith('Workflow run not found')) throw error;

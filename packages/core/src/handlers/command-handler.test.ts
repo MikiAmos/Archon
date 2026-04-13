@@ -1807,7 +1807,6 @@ describe('CommandHandler', () => {
         expect(result.message).toContain('loop input received');
         expect(result.message).toContain('my-loop-wf');
         expect(mockUpdateWorkflowRun).toHaveBeenCalledWith('run-123', {
-          status: 'failed',
           metadata: { loop_user_input: 'Add error handling' },
         });
       });

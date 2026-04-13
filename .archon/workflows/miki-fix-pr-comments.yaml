@@ -1,0 +1,171 @@
+name: miki-fix-pr-comments
+description: |
+  Use when: Addressing PR review feedback/comments.
+  Triggers: "fix pr comments", "address review", "fix feedback", "pr comments",
+            "review feedback", "address comments on PR".
+  NOT for: Creating new PRs (use miki-feature/miki-bugfix), code reviews (use miki-review).
+
+  Parallel-capable workflow:
+  1. Fetch all unaddressed PR comments
+  2. Classify each comment (code fix / architecture / question / nit)
+  3. Fix by type (TDD for code/architecture, direct for nits, draft reply for questions)
+  4. Review chain (domain + Codex adversarial)
+  5. Human gate
+  6. Commit, push, reply to all comments
+
+provider: claude
+model: sonnet
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: FETCH COMMENTS
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: identify-pr
+    prompt: |
+      Identify the PR to address comments for.
+
+      Request: $ARGUMENTS
+
+      Rules:
+      - Look for PR number in the request
+      - If not specified, check the current branch: `gh pr view --json number,url`
+      - Output: PR_NUMBER and PR_URL
+    model: sonnet
+
+  - id: fetch-comments
+    prompt: |
+      Fetch all unaddressed review comments on the PR.
+
+      PR: $identify-pr.output
+
+      Instructions:
+      1. Get all review comments: `gh pr view {PR_NUMBER} --json reviews,comments`
+      2. Get inline comments: `gh api repos/{owner}/{repo}/pulls/{PR_NUMBER}/comments`
+      3. Filter to unresolved/unaddressed comments
+      4. For each comment, capture:
+         - Author
+         - File and line (if inline)
+         - Comment body
+         - Type suggestion (if apparent)
+
+      Write structured list to $ARTIFACTS_DIR/pr-comments.md
+    depends_on: [identify-pr]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: CLASSIFY & FIX
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: classify-and-fix
+    prompt: |
+      Classify each PR comment and fix accordingly.
+
+      Read $ARTIFACTS_DIR/pr-comments.md for the comment list.
+      Read CLAUDE.md for project conventions.
+
+      ## Classification Rules
+
+      | Type | Indicators | Fix Approach |
+      |------|------------|--------------|
+      | Code fix | "bug", "wrong", "should be", specific code suggestion | TDD: write failing test, then fix |
+      | Architecture | "restructure", "move", "separate", design concern | TDD: write test for expected behavior, then refactor |
+      | Question | "why", "what about", "can you explain" | Draft a reply (no code change) |
+      | Nit | "nit:", "minor:", style suggestion, naming | Direct fix, no test needed |
+
+      ## For each comment:
+      1. Classify it
+      2. Apply the fix approach:
+         - Code fix / Architecture → write failing test FIRST, then fix
+         - Question → draft reply text
+         - Nit → apply fix directly
+      3. Run tests after each fix to catch regressions
+
+      ## Output
+      Write to $ARTIFACTS_DIR/fixes.md:
+      - Each comment with classification
+      - What was done (fix applied or reply drafted)
+      - Test results after fixes
+    depends_on: [fetch-comments]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: REVIEW CHAIN
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: domain-review
+    prompt: |
+      Run domain-specific review on all changes since last push.
+
+      1. Get diff of new changes: `git diff HEAD~1...HEAD` or since last push
+      2. Route by file type: .py → py-review, .ts/.tsx/.vue → ui-review
+      3. REPORT → AUTO-FIX Critical + Important
+      4. Re-run tests
+
+      Write to $ARTIFACTS_DIR/domain-review.md
+    depends_on: [classify-and-fix]
+    context: fresh
+
+  - id: codex-adversarial
+    prompt: |
+      Run adversarial review on the full diff.
+
+      1. Run /codex:adversarial-review or manual adversarial review
+      2. Full diff: `git diff $BASE_BRANCH...HEAD`
+      3. If CRITICAL → WORKFLOW_STOP: true in $ARTIFACTS_DIR/codex-review.md
+
+      Write to $ARTIFACTS_DIR/codex-review.md
+    depends_on: [domain-review]
+    context: fresh
+
+  - id: check-codex-result
+    bash: |
+      if grep -q "WORKFLOW_STOP: true" "$ARTIFACTS_DIR/codex-review.md" 2>/dev/null; then
+        echo "CRITICAL findings — stopping"
+        exit 1
+      fi
+      echo "Review passed"
+    depends_on: [codex-adversarial]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: HUMAN GATE & SHIP
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: human-gate
+    prompt: |
+      Present PR comment fixes for approval.
+
+      Show:
+      1. Summary of each comment and how it was addressed (from $ARTIFACTS_DIR/fixes.md)
+      2. `git diff --stat`
+      3. Review highlights
+      4. Test results
+
+      WAIT for explicit approval before committing.
+    depends_on: [check-codex-result]
+    interactive: true
+
+  - id: commit-and-push
+    prompt: |
+      Commit and push the PR comment fixes.
+
+      1. `git add -A`
+      2. Conventional commit: `fix: address PR review comments`
+      3. `git push`
+    depends_on: [human-gate]
+    model: sonnet
+
+  - id: reply-to-comments
+    prompt: |
+      Reply to every PR comment that was addressed.
+
+      Read $ARTIFACTS_DIR/fixes.md for the fix details.
+
+      For each comment:
+      - Code fix / Architecture / Nit → reply with what was changed
+      - Question → post the drafted reply
+
+      Use: `gh api repos/{owner}/{repo}/pulls/{PR_NUMBER}/comments/{comment_id}/replies --method POST -f body="..."`
+      Or for general comments: `gh pr comment {PR_NUMBER} --body "..."`
+    depends_on: [commit-and-push]
+    context: fresh
+    model: sonnet

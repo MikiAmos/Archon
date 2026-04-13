@@ -1,0 +1,208 @@
+name: miki-architecture
+description: |
+  Use when: Improving codebase architecture, reducing tech debt, or consolidating after a development surge.
+  Triggers: "improve architecture", "refactor", "code quality", "tech debt", "clean up",
+            "architecture review", "make this more maintainable".
+  NOT for: Specific feature work (use miki-feature), bug fixes (use miki-bugfix).
+
+  Periodic workflow — run after a surge of feature work or weekly maintenance:
+  1. Scan codebase for shallow modules and tech debt
+  2. Prioritize by impact vs effort
+  3. Propose specific refactoring changes
+  4. Human approval for which proposals to implement
+  5. TDD implementation of approved changes
+  6. Review chain
+  7. Human gate, commit, PR
+
+provider: claude
+model: sonnet
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: SCAN & ANALYZE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: scan-codebase
+    prompt: |
+      Perform an architecture health scan of this codebase.
+
+      ## Instructions
+      1. Read CLAUDE.md for project conventions and architecture reference
+      2. Explore the codebase looking for:
+         - **Shallow modules**: files that are just thin wrappers adding no value
+         - **God objects/files**: files doing too many things (>300 lines, multiple responsibilities)
+         - **Duplicated logic**: similar code in multiple places that should be consolidated
+         - **Leaky abstractions**: implementation details leaking across module boundaries
+         - **Missing abstractions**: repeated patterns that should be extracted
+         - **Dead code**: unreachable or unused functions/classes
+         - **Inconsistent patterns**: same thing done differently in different places
+      3. For each finding, provide:
+         - File:line references
+         - Severity (High / Medium / Low)
+         - Estimated effort to fix (Small / Medium / Large)
+         - Description of the problem and impact
+
+      $ARGUMENTS
+
+      Write findings to $ARTIFACTS_DIR/architecture-scan.md
+    context: fresh
+
+  - id: prioritize
+    prompt: |
+      Prioritize the architecture findings by impact and effort.
+
+      Read $ARTIFACTS_DIR/architecture-scan.md
+
+      ## Instructions
+      1. Create an impact/effort matrix:
+         - High impact + Small effort → DO FIRST
+         - High impact + Medium effort → DO NEXT
+         - Medium impact + Small effort → QUICK WINS
+         - Everything else → BACKLOG
+      2. For each "DO FIRST" and "DO NEXT" item, write a specific refactoring proposal:
+         - What to change (files, functions, patterns)
+         - How to change it (specific approach)
+         - Risk assessment (what could break)
+         - Testing approach (how to verify)
+
+      Write to $ARTIFACTS_DIR/proposals.md
+    depends_on: [scan-codebase]
+    context: fresh
+    model: claude-opus-4-6
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: HUMAN APPROVAL
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: human-approve-proposals
+    prompt: |
+      Present architecture improvement proposals for approval.
+
+      Read and display $ARTIFACTS_DIR/proposals.md
+
+      Show the prioritized list with impact/effort for each.
+
+      Ask: "Which of these proposals do you want me to implement? You can select all,
+      some, or none. You can also reorder or modify them."
+
+      WAIT for the user to specify which proposals to proceed with.
+      Save approved proposals to $ARTIFACTS_DIR/approved-proposals.md
+    depends_on: [prioritize]
+    interactive: true
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: IMPLEMENT
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: setup-branch
+    bash: |
+      DATE=$(date +%Y%m%d)
+      BRANCH="refactor/architecture-improvement-$DATE"
+      git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+      echo "Branch: $BRANCH"
+    depends_on: [human-approve-proposals]
+
+  - id: implement-changes
+    prompt: |
+      Implement the approved architecture improvements using TDD.
+
+      Read $ARTIFACTS_DIR/approved-proposals.md for what to implement.
+
+      ## Rules
+      1. Implement one proposal at a time
+      2. For each proposal:
+         - Write/update tests FIRST to capture expected behavior
+         - Make the change
+         - Run tests to verify no regressions
+         - Commit atomically (one commit per proposal)
+      3. Keep changes minimal — refactor, don't rewrite
+      4. Run the full test suite after all changes
+
+      Write implementation log to $ARTIFACTS_DIR/implementation.md
+    depends_on: [setup-branch]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: REVIEW CHAIN
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: domain-review
+    prompt: |
+      Review all architecture changes.
+
+      1. Get diff: `git diff $BASE_BRANCH...HEAD`
+      2. Route by file type for domain review
+      3. REPORT → AUTO-FIX Critical + Important
+      4. Re-run tests
+
+      Write to $ARTIFACTS_DIR/domain-review.md
+    depends_on: [implement-changes]
+    context: fresh
+
+  - id: codex-adversarial
+    prompt: |
+      Adversarial review on all architecture changes.
+
+      Full diff: `git diff $BASE_BRANCH...HEAD`
+      Target: regressions, broken interfaces, missing tests for refactored code
+
+      If CRITICAL → WORKFLOW_STOP: true in $ARTIFACTS_DIR/codex-review.md
+      Write to $ARTIFACTS_DIR/codex-review.md
+    depends_on: [domain-review]
+    context: fresh
+
+  - id: check-codex-result
+    bash: |
+      if grep -q "WORKFLOW_STOP: true" "$ARTIFACTS_DIR/codex-review.md" 2>/dev/null; then
+        echo "CRITICAL findings — stopping"
+        exit 1
+      fi
+      echo "Review passed"
+    depends_on: [codex-adversarial]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5: HUMAN GATE & SHIP
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: human-gate
+    prompt: |
+      Present architecture changes for approval.
+
+      Show:
+      1. `git diff --stat $BASE_BRANCH...HEAD`
+      2. Proposals implemented from $ARTIFACTS_DIR/implementation.md
+      3. Review results from $ARTIFACTS_DIR/domain-review.md and $ARTIFACTS_DIR/codex-review.md
+      4. Test results
+
+      WAIT for explicit approval.
+    depends_on: [check-codex-result]
+    interactive: true
+
+  - id: commit-and-push
+    prompt: |
+      Push the architecture improvement branch.
+
+      Note: individual proposals should already be committed atomically during implementation.
+      Just push: `git push -u origin HEAD`
+    depends_on: [human-gate]
+    model: haiku
+
+  - id: create-pr
+    prompt: |
+      Create a PR for the architecture improvements.
+
+      1. `gh pr create --base $BASE_BRANCH`
+      2. Title: "refactor: architecture improvements"
+      3. Body: list each proposal implemented with before/after description
+      4. Report PR URL
+    depends_on: [commit-and-push]
+    context: fresh
+    model: haiku
+
+  - id: worktree-cleanup
+    prompt: |
+      Check for untracked files before worktree cleanup.
+      List any untracked files and ask user if they want to keep them.
+    depends_on: [create-pr]
+    interactive: true
+    model: haiku

@@ -1059,7 +1059,7 @@ describe('POST /api/workflows/runs/:runId/resume', () => {
     expect(response.status).toBe(200);
     const body = (await response.json()) as { success: boolean; message: string };
     expect(body.success).toBe(true);
-    expect(body.message).toContain('ready to resume');
+    expect(body.message).toContain('Workflow resuming');
   });
 });
 
@@ -1327,7 +1327,6 @@ describe('POST /api/workflows/runs/:runId/reject', () => {
     expect(body.success).toBe(true);
     expect(body.message).toContain('On-reject prompt');
     expect(mockUpdateWorkflowRun).toHaveBeenCalledWith('run-on-reject', {
-      status: 'failed',
       metadata: { rejection_reason: 'needs more tests', rejection_count: 1 },
     });
     expect(mockCancelWorkflowRun).not.toHaveBeenCalled();

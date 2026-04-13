@@ -112,6 +112,7 @@ export type SandboxSettings = z.infer<typeof sandboxSettingsSchema>;
 
 export const dagNodeBaseSchema = z.object({
   id: z.string(),
+  name: z.string().min(1, 'node display name cannot be empty').optional(),
   depends_on: z.array(z.string()).optional(),
   when: z.string().optional(),
   trigger_rule: triggerRuleSchema.optional(),

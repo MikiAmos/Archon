@@ -125,8 +125,8 @@ export async function abandonWorkflow(runId: string): Promise<WorkflowRun> {
  * Approve a paused workflow run.
  *
  * Handles both interactive_loop and standard approval gate paths.
- * Transitions run to 'failed' so findResumableRun picks it up on next invocation.
- * Does NOT auto-resume — callers decide whether to execute.
+ * Keeps status as-is ('paused') — callers are responsible for dispatching the resume.
+ * findResumableRun/findResumableRunByParentConversation match both 'paused' and 'failed'.
  */
 export async function approveWorkflow(
   runId: string,
@@ -160,11 +160,10 @@ export async function approveWorkflow(
         step_name: approval.nodeId,
         data: { decision: 'approved', comment: approvalComment, iteration: approval.iteration },
       });
-      // Transition to 'failed' so findResumableRun picks it up.
+      // Keep status as-is ('paused') — the caller dispatches the resume.
       // IMPORTANT: metadata is MERGED (not replaced) — the approval context must survive
       // intact so the resumed executor can detect the correct startIteration.
       await workflowDb.updateWorkflowRun(runId, {
-        status: 'failed',
         metadata: { loop_user_input: approvalComment },
       });
       return {
@@ -191,9 +190,8 @@ export async function approveWorkflow(
       step_name: approval.nodeId,
       data: { decision: 'approved', comment: approvalComment },
     });
-    // Transition to 'failed' so findResumableRun picks it up. Clear any rejection state.
+    // Keep status as-is ('paused') — the caller dispatches the resume. Clear any rejection state.
     await workflowDb.updateWorkflowRun(runId, {
-      status: 'failed',
       metadata: { approval_response: 'approved', rejection_reason: '', rejection_count: 0 },
     });
   } catch (error) {

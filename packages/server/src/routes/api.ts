@@ -1896,11 +1896,32 @@ export function registerApiRoutes(
       if (!RESUMABLE_WORKFLOW_STATUSES.includes(run.status)) {
         return apiError(c, 400, `Cannot resume workflow in '${run.status}' status`);
       }
-      // Run is already failed — the next invocation on the same path auto-resumes
-      const pathInfo = run.working_path ? ` at \`${run.working_path}\`` : '';
+
+      // Auto-resume: dispatch a continuation message to the orchestrator so the workflow
+      // picks up from where it stopped, skipping completed nodes.
+      const parentDbId = run.parent_conversation_id as string | undefined;
+      if (parentDbId) {
+        void (async (): Promise<void> => {
+          try {
+            const parentConv = await conversationDb.getConversationById(parentDbId);
+            const platformConvId = parentConv?.platform_conversation_id;
+            if (platformConvId) {
+              await dispatchToOrchestrator(platformConvId, '(resume: continuing from failed node)');
+            } else {
+              getLog().warn({ runId, parentDbId }, 'api.workflow_resume_no_platform_conv_id');
+            }
+          } catch (resumeErr) {
+            getLog().error(
+              { err: resumeErr as Error, runId, parentDbId },
+              'api.workflow_resume_auto_dispatch_failed'
+            );
+          }
+        })();
+      }
+
       return c.json({
         success: true,
-        message: `Workflow run ready to resume: ${run.workflow_name}${pathInfo}. Re-run the workflow to auto-resume from completed nodes.`,
+        message: `Workflow resuming: ${run.workflow_name}. Skipping completed nodes.`,
       });
     } catch (error) {
       getLog().error({ err: error, runId }, 'api.workflow_run_resume_failed');
@@ -1935,7 +1956,9 @@ export function registerApiRoutes(
       if (!run) {
         return apiError(c, 404, 'Workflow run not found');
       }
-      if (run.status !== 'paused') {
+      // Accept 'paused' (normal) or 'failed' with approval metadata (recovery after server restart)
+      const hasApprovalContext = run.metadata?.approval != null;
+      if (run.status !== 'paused' && !(run.status === 'failed' && hasApprovalContext)) {
         return apiError(c, 400, `Cannot approve workflow in '${run.status}' status`);
       }
       const body = (await c.req.json().catch(() => ({}))) as { comment?: string };
@@ -1969,12 +1992,35 @@ export function registerApiRoutes(
           ? { loop_user_input: comment }
           : { approval_response: 'approved', rejection_reason: '', rejection_count: 0 };
       await workflowDb.updateWorkflowRun(runId, {
-        status: 'failed',
         metadata: metadataUpdate,
       });
+
+      // Auto-resume: dispatch a continuation message to the orchestrator so the workflow
+      // picks up from where it paused. Without this, the user must manually send a message.
+      // The run has parent_conversation_id (DB ID) — we need the platform conversation ID.
+      const parentDbId = run.parent_conversation_id as string | undefined;
+      if (parentDbId) {
+        void (async (): Promise<void> => {
+          try {
+            const parentConv = await conversationDb.getConversationById(parentDbId);
+            const platformConvId = parentConv?.platform_conversation_id;
+            if (platformConvId) {
+              await dispatchToOrchestrator(platformConvId, `(approved: ${comment})`);
+            } else {
+              getLog().warn({ runId, parentDbId }, 'api.workflow_approve_no_platform_conv_id');
+            }
+          } catch (resumeErr) {
+            getLog().error(
+              { err: resumeErr as Error, runId, parentDbId },
+              'api.workflow_approve_auto_resume_failed'
+            );
+          }
+        })();
+      }
+
       return c.json({
         success: true,
-        message: `Workflow approved: ${run.workflow_name}. Send a message to continue the workflow.`,
+        message: `Workflow approved: ${run.workflow_name}. Resuming automatically.`,
       });
     } catch (error) {
       getLog().error({ err: error, runId }, 'api.workflow_run_approve_failed');
@@ -1990,7 +2036,9 @@ export function registerApiRoutes(
       if (!run) {
         return apiError(c, 404, 'Workflow run not found');
       }
-      if (run.status !== 'paused') {
+      // Accept 'paused' (normal) or 'failed' with approval metadata (recovery after server restart)
+      const hasRejectApprovalCtx = run.metadata?.approval != null;
+      if (run.status !== 'paused' && !(run.status === 'failed' && hasRejectApprovalCtx)) {
         return apiError(c, 400, `Cannot reject workflow in '${run.status}' status`);
       }
       const body = (await c.req.json().catch(() => ({}))) as { reason?: string };
@@ -2015,12 +2063,36 @@ export function registerApiRoutes(
           });
         }
         await workflowDb.updateWorkflowRun(runId, {
-          status: 'failed',
           metadata: { rejection_reason: reason, rejection_count: currentCount + 1 },
         });
+
+        // Auto-resume: dispatch continuation so on_reject prompt runs automatically
+        const rejectParentDbId = run.parent_conversation_id as string | undefined;
+        if (rejectParentDbId) {
+          void (async (): Promise<void> => {
+            try {
+              const parentConv = await conversationDb.getConversationById(rejectParentDbId);
+              const platformConvId = parentConv?.platform_conversation_id;
+              if (platformConvId) {
+                await dispatchToOrchestrator(platformConvId, `(rejected: ${reason})`);
+              } else {
+                getLog().warn(
+                  { runId, parentDbId: rejectParentDbId },
+                  'api.workflow_reject_no_platform_conv_id'
+                );
+              }
+            } catch (resumeErr) {
+              getLog().error(
+                { err: resumeErr as Error, runId, parentDbId: rejectParentDbId },
+                'api.workflow_reject_auto_resume_failed'
+              );
+            }
+          })();
+        }
+
         return c.json({
           success: true,
-          message: `Workflow rejected: ${run.workflow_name}. On-reject prompt will run on resume.`,
+          message: `Workflow rejected: ${run.workflow_name}. On-reject prompt running automatically.`,
         });
       }
 
@@ -2225,6 +2297,29 @@ export function registerApiRoutes(
           if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
             getLog().error({ err, name }, 'workflow.fetch_failed');
             return apiError(c, 500, 'Failed to read workflow');
+          }
+        }
+      }
+
+      // 1b. Try global workflows (~/.archon/.archon/workflows/)
+      {
+        const [globalWorkflowFolder] = getWorkflowFolderSearchPaths();
+        const globalFilePath = join(getArchonHome(), globalWorkflowFolder, filename);
+        try {
+          const content = await readFile(globalFilePath, 'utf-8');
+          const result = parseWorkflow(content, filename);
+          if (result.error) {
+            return apiError(c, 500, `Global workflow file is invalid: ${result.error.error}`);
+          }
+          return c.json({
+            workflow: result.workflow,
+            filename,
+            source: 'project' as WorkflowSource,
+          });
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+            getLog().error({ err, name }, 'workflow.fetch_global_failed');
+            return apiError(c, 500, 'Failed to read global workflow');
           }
         }
       }

@@ -1,0 +1,247 @@
+name: miki-bugfix
+description: |
+  Use when: Fixing a bug from a Linear issue or bug report.
+  Triggers: "fix bug", "fix MIK-XXX", "bugfix", "this is broken", "debug this",
+            "investigate bug", "fix this issue" (when issue is labeled Bug).
+  NOT for: New features (use miki-feature), PR comments (use miki-fix-pr-comments),
+           code reviews (use miki-review).
+
+  Parallel-capable workflow:
+  1. Fetch issue details
+  2. Investigate & reproduce (up to 3 rounds, then escalate)
+  3. TDD fix (write failing test first, then fix)
+  4. Domain review (py-review / ui-review)
+  5. Codex adversarial review (full diff)
+  6. Human gate before commit
+  7. Commit, push, create PR, update Linear
+  8. Worktree cleanup
+
+provider: claude
+model: sonnet
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: FETCH
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: extract-issue-id
+    prompt: |
+      Extract the Linear issue ID from the user request.
+
+      Request: $ARGUMENTS
+
+      Output ONLY the issue identifier (e.g., MIK-200). No quotes, no markdown.
+    model: haiku
+    allowed_tools: []
+
+  - id: fetch-issue
+    prompt: |
+      Fetch the full details of Linear issue $extract-issue-id.output using the Linear MCP get_issue tool.
+
+      Output a structured summary:
+      - TITLE: ...
+      - DESCRIPTION: ...
+      - STEPS_TO_REPRODUCE: ... (extract from description if available)
+      - EXPECTED_BEHAVIOR: ...
+      - ACTUAL_BEHAVIOR: ...
+      - PRIORITY: ...
+    depends_on: [extract-issue-id]
+    model: haiku
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: INVESTIGATE & REPRODUCE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: investigate
+    prompt: |
+      Investigate and reproduce this bug.
+
+      ## Bug Report
+      $fetch-issue.output
+
+      ## Instructions
+
+      1. Read CLAUDE.md for project conventions
+      2. Read tasks/lessons.md for known gotchas
+      3. Trace the code path described in the bug report
+      4. Try to reproduce the bug:
+         - Write a test that demonstrates the failure
+         - Run it to confirm it fails
+      5. Identify root cause with file:line references
+
+      ## If you CANNOT reproduce after thorough investigation:
+      - Document what you tried and what you found
+      - Write findings to $ARTIFACTS_DIR/investigation.md with REPRODUCED: false
+      - The workflow will retry up to 2 more times
+
+      ## Output
+      Write to $ARTIFACTS_DIR/investigation.md:
+      - ROOT_CAUSE: file:line and explanation
+      - REPRODUCED: true/false
+      - FAILING_TEST: file path of the test that demonstrates the bug
+      - FIX_APPROACH: brief description of the fix
+      - ATTEMPT: 1
+    depends_on: [fetch-issue]
+    context: fresh
+
+  - id: check-reproduced
+    bash: |
+      if grep -q "REPRODUCED: true" "$ARTIFACTS_DIR/investigation.md" 2>/dev/null; then
+        echo "Bug reproduced — proceeding to fix"
+        exit 0
+      fi
+
+      ATTEMPT=$(grep -oP 'ATTEMPT: \K[0-9]+' "$ARTIFACTS_DIR/investigation.md" 2>/dev/null || echo "1")
+      if [ "$ATTEMPT" -ge "3" ]; then
+        echo "ESCALATE: Could not reproduce after 3 attempts"
+        echo "See $ARTIFACTS_DIR/investigation.md for details"
+        exit 1
+      fi
+
+      echo "Not reproduced — retry (attempt $ATTEMPT)"
+      exit 0
+    depends_on: [investigate]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: TDD FIX
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: setup-branch
+    bash: |
+      ISSUE_ID=$(echo "$extract-issue-id.output" | tr -d "'\"\`\n " | grep -oE 'MIK-[0-9]+' | head -1)
+      BRANCH="fix/$(echo $ISSUE_ID | tr '[:upper:]' '[:lower:]')"
+      git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+      echo "Branch: $BRANCH"
+    depends_on: [check-reproduced]
+
+  - id: linear-in-progress
+    prompt: |
+      Update Linear issue $extract-issue-id.output:
+      1. Move state to "In Progress"
+      2. Add comment: "🐛 Investigating. Branch: $setup-branch.output"
+    depends_on: [setup-branch]
+    model: haiku
+
+  - id: tdd-fix
+    prompt: |
+      Fix this bug using TDD.
+
+      ## Context
+      Read $ARTIFACTS_DIR/investigation.md for:
+      - Root cause and file locations
+      - The failing test that reproduces the bug
+
+      ## TDD Rules
+      1. Verify the failing test exists and fails (RED)
+      2. Write the minimum fix to make it pass (GREEN)
+      3. Refactor if needed while keeping tests green (REFACTOR)
+      4. Run the full test suite to catch regressions
+
+      ## Output
+      Write to $ARTIFACTS_DIR/implementation.md:
+      - Files modified
+      - What was fixed and why
+      - Test results (all passing)
+    depends_on: [linear-in-progress]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: REVIEW CHAIN
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: domain-review
+    prompt: |
+      Run domain-specific code review on the bug fix.
+
+      1. Get diff: `git diff $BASE_BRANCH...HEAD`
+      2. Route by file type: .py → py-review checklist, .ts/.tsx/.vue → ui-review checklist
+      3. REPORT mode → AUTO-FIX Critical + Important
+      4. Re-run tests after fixes
+
+      Write results to $ARTIFACTS_DIR/domain-review.md
+    depends_on: [tdd-fix]
+    context: fresh
+
+  - id: codex-adversarial
+    prompt: |
+      Run adversarial review on the full diff.
+
+      1. Run /codex:adversarial-review if available, otherwise manual adversarial review
+      2. Review full diff: `git diff $BASE_BRANCH...HEAD`
+      3. Target: security, failure modes, edge cases, regression risk
+
+      If CRITICAL findings → write WORKFLOW_STOP: true to $ARTIFACTS_DIR/codex-review.md
+
+      Write all findings to $ARTIFACTS_DIR/codex-review.md
+    depends_on: [domain-review]
+    context: fresh
+
+  - id: check-codex-result
+    bash: |
+      if grep -q "WORKFLOW_STOP: true" "$ARTIFACTS_DIR/codex-review.md" 2>/dev/null; then
+        echo "CRITICAL findings — stopping for human review"
+        cat "$ARTIFACTS_DIR/codex-review.md"
+        exit 1
+      fi
+      echo "Review passed"
+    depends_on: [codex-adversarial]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5: HUMAN GATE & SHIP
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: human-gate
+    prompt: |
+      Present bug fix for approval.
+
+      Show:
+      1. `git diff --stat $BASE_BRANCH...HEAD`
+      2. Root cause from $ARTIFACTS_DIR/investigation.md
+      3. Fix summary from $ARTIFACTS_DIR/implementation.md
+      4. Review highlights from $ARTIFACTS_DIR/domain-review.md and $ARTIFACTS_DIR/codex-review.md
+      5. Test results (run tests one more time)
+
+      WAIT for explicit approval before committing.
+    depends_on: [check-codex-result]
+    interactive: true
+
+  - id: commit-and-push
+    prompt: |
+      Commit and push the bug fix.
+
+      1. `git add -A`
+      2. Conventional commit: `fix: {description} (closes $extract-issue-id.output)`
+      3. `git push -u origin HEAD`
+    depends_on: [human-gate]
+    model: haiku
+
+  - id: create-pr
+    prompt: |
+      Create a PR for the bug fix.
+
+      1. `gh pr create --base $BASE_BRANCH`
+      2. Title: "fix: {concise description}"
+      3. Body: root cause, fix, testing done, "Closes $extract-issue-id.output"
+      4. Report PR URL
+    depends_on: [commit-and-push]
+    context: fresh
+    model: haiku
+
+  - id: update-linear
+    prompt: |
+      Update Linear issue $extract-issue-id.output:
+      1. Move to "In Review"
+      2. Comment: "🔍 Bug fix PR created: {PR URL}. Root cause: {one-line summary}"
+    depends_on: [create-pr]
+    model: haiku
+
+  - id: worktree-cleanup
+    prompt: |
+      Check for untracked files before worktree cleanup.
+
+      1. Run `git status --porcelain`
+      2. If untracked files → list them, ask user if they want to copy any
+      3. If clean → report ready for cleanup
+    depends_on: [update-linear]
+    interactive: true
+    model: haiku
