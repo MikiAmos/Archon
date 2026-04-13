@@ -52,6 +52,10 @@ mock.module('../config/config-loader', () => ({
   loadConfig: mock(() => Promise.resolve({ assistant: 'claude' })),
 }));
 
+mock.module('../mcp/discovery', () => ({
+  discoverUserMcpServers: mock(() => Promise.resolve({})),
+}));
+
 const { createWorkflowStore, createWorkflowDeps } = await import('./store-adapter');
 
 describe('createWorkflowStore', () => {
@@ -145,18 +149,29 @@ describe('createWorkflowStore', () => {
 });
 
 describe('createWorkflowDeps', () => {
-  test('returns WorkflowDeps with store, getAssistantClient, and loadConfig', () => {
-    const deps = createWorkflowDeps();
+  test('returns WorkflowDeps with store, getAssistantClient, and loadConfig', async () => {
+    const deps = await createWorkflowDeps({});
     expect(deps.store).toBeDefined();
     expect(typeof deps.getAssistantClient).toBe('function');
     expect(typeof deps.loadConfig).toBe('function');
   });
 
-  test('store from createWorkflowDeps has all IWorkflowStore methods', () => {
-    const deps = createWorkflowDeps();
+  test('store from createWorkflowDeps has all IWorkflowStore methods', async () => {
+    const deps = await createWorkflowDeps({});
     expect(typeof deps.store.createWorkflowRun).toBe('function');
     expect(typeof deps.store.getWorkflowRun).toBe('function');
     expect(typeof deps.store.createWorkflowEvent).toBe('function');
     expect(typeof deps.store.getCodebase).toBe('function');
+  });
+
+  test('mcpServers is undefined when empty map is passed', async () => {
+    const deps = await createWorkflowDeps({});
+    expect(deps.mcpServers).toBeUndefined();
+  });
+
+  test('mcpServers is set when non-empty map is passed', async () => {
+    const servers = { github: { type: 'stdio' as const, command: 'mcp-github' } };
+    const deps = await createWorkflowDeps(servers);
+    expect(deps.mcpServers).toEqual(servers);
   });
 });

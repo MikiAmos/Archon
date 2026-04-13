@@ -267,7 +267,7 @@ async function dispatchOrchestratorWorkflow(
         'orchestrator.foreground_resume_detected'
       );
       await executeWorkflow(
-        createWorkflowDeps(),
+        await createWorkflowDeps(),
         platform,
         conversationId,
         resumableRun.working_path,
@@ -279,7 +279,7 @@ async function dispatchOrchestratorWorkflow(
     } else if (workflow.interactive) {
       // Interactive workflows run in foreground so output stays in the user's conversation
       await executeWorkflow(
-        createWorkflowDeps(),
+        await createWorkflowDeps(),
         platform,
         conversationId,
         cwd,
@@ -305,7 +305,7 @@ async function dispatchOrchestratorWorkflow(
     }
   } else {
     await executeWorkflow(
-      createWorkflowDeps(),
+      await createWorkflowDeps(),
       platform,
       conversationId,
       cwd,
@@ -529,9 +529,16 @@ export async function handleMessage(
       );
     }
 
-    // Natural-language approval routing — if a workflow is paused in this
-    // conversation, treat any non-slash message as the approval response.
+    // Approval routing — if a workflow is paused in this conversation, treat any
+    // non-slash message as the approval/resume trigger. This handles both:
+    // - Natural-language approvals (user types a message)
+    // - API dispatches: approve/reject/resume endpoints send "(approved: ...)",
+    //   "(rejected: ...)", or "(resume: ...)" after writing events + metadata.
     if (!message.startsWith('/')) {
+      const isApiResumeDispatch =
+        message.startsWith('(approved:') ||
+        message.startsWith('(rejected:') ||
+        message.startsWith('(resume:');
       const pausedRun = await workflowDb.getPausedWorkflowRun(conversation.id);
       if (pausedRun) {
         const approvalRaw = pausedRun.metadata.approval;
@@ -559,40 +566,44 @@ export async function handleMessage(
             workflowRunId: pausedRun.id,
             nodeId: approval.nodeId,
             workflowName: pausedRun.workflow_name,
+            isApiResumeDispatch,
           },
-          'orchestrator.natural_language_approval_started'
+          'orchestrator.approval_routing_started'
         );
 
         try {
-          // Write approval events — for interactive loops, do NOT write node_completed
-          // (the executor writes it when the AI emits the completion signal on actual exit).
-          if (approval.type !== 'interactive_loop') {
-            const nodeOutput = approval.captureResponse === true ? message : '';
+          // For natural-language approvals, write events and update metadata.
+          // API dispatches (approve/reject/resume endpoints) already wrote them.
+          if (!isApiResumeDispatch) {
+            // Write approval events — for interactive loops, do NOT write node_completed
+            // (the executor writes it when the AI emits the completion signal on actual exit).
+            if (approval.type !== 'interactive_loop') {
+              const nodeOutput = approval.captureResponse === true ? message : '';
+              await workflowEventDb.createWorkflowEvent({
+                workflow_run_id: pausedRun.id,
+                event_type: 'node_completed',
+                step_name: approval.nodeId,
+                data: { node_output: nodeOutput, approval_decision: 'approved' },
+              });
+            }
             await workflowEventDb.createWorkflowEvent({
               workflow_run_id: pausedRun.id,
-              event_type: 'node_completed',
+              event_type: 'approval_received',
               step_name: approval.nodeId,
-              data: { node_output: nodeOutput, approval_decision: 'approved' },
+              data: { decision: 'approved', comment: message },
+            });
+            // For interactive loops, store user input; for standard approvals, mark as approved
+            // and clear any rejection state.
+            const metadataUpdate: Record<string, unknown> =
+              approval.type === 'interactive_loop'
+                ? { loop_user_input: message }
+                : { approval_response: 'approved', rejection_reason: '', rejection_count: 0 };
+            await workflowDb.updateWorkflowRun(pausedRun.id, {
+              metadata: metadataUpdate,
             });
           }
-          await workflowEventDb.createWorkflowEvent({
-            workflow_run_id: pausedRun.id,
-            event_type: 'approval_received',
-            step_name: approval.nodeId,
-            data: { decision: 'approved', comment: message },
-          });
-          // For interactive loops, store user input; for standard approvals, mark as approved
-          // and clear any rejection state.
-          const metadataUpdate: Record<string, unknown> =
-            approval.type === 'interactive_loop'
-              ? { loop_user_input: message }
-              : { approval_response: 'approved', rejection_reason: '', rejection_count: 0 };
-          await workflowDb.updateWorkflowRun(pausedRun.id, {
-            status: 'failed',
-            metadata: metadataUpdate,
-          });
 
-          // Discover workflow and resume
+          // Discover workflow and resume — common path for both natural-language and API dispatches
           const { workflows: discoveredWorkflows } = await discoverAllWorkflows(conversation);
           const allWorkflows: WorkflowDefinition[] = discoveredWorkflows.map(w => w.workflow);
           const workflow = findWorkflow(pausedRun.workflow_name, allWorkflows);
@@ -627,12 +638,12 @@ export async function handleMessage(
           );
           getLog().info(
             { conversationId, workflowRunId: pausedRun.id, workflowName: pausedRun.workflow_name },
-            'orchestrator.natural_language_approval_completed'
+            'orchestrator.approval_routing_completed'
           );
         } catch (error) {
           getLog().error(
             { err: error as Error, workflowRunId: pausedRun.id, conversationId },
-            'orchestrator.natural_language_approval_failed'
+            'orchestrator.approval_routing_failed'
           );
           await platform.sendMessage(
             conversationId,

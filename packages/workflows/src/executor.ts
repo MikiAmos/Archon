@@ -14,6 +14,8 @@ import { logWorkflowStart, logWorkflowError } from './logger';
 import { getWorkflowEventEmitter } from './event-emitter';
 import { isClaudeModel, isModelCompatible } from './model-validation';
 import { classifyError } from './executor-shared';
+import { discoverProjectMcpServers, filterMcpServers } from './mcp/mcp-utils';
+import type { McpServerMap } from './mcp/mcp-utils';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -274,6 +276,18 @@ export async function executeWorkflow(
   }
 
   const docsDir = config.docsPath ?? 'docs/';
+
+  // Merge MCP servers: user plugins (cached on deps) + project-level (per-run)
+  const projectMcpServers = await discoverProjectMcpServers(cwd);
+  const mergedMcpServers: McpServerMap = { ...deps.mcpServers, ...projectMcpServers };
+  const filteredMcpServers =
+    Object.keys(mergedMcpServers).length > 0
+      ? filterMcpServers(
+          mergedMcpServers,
+          workflow.mcp_servers?.include,
+          workflow.mcp_servers?.exclude
+        )
+      : undefined;
 
   // Resolve provider and model once (used by all nodes)
   // When workflow sets a model but not a provider, infer provider from the model.
@@ -635,7 +649,8 @@ export async function executeWorkflow(
       config,
       configuredCommandFolder,
       issueContext,
-      dagPriorCompletedNodes
+      dagPriorCompletedNodes,
+      filteredMcpServers
     );
 
     // executeDagWorkflow throws on fatal errors; check DB status for result

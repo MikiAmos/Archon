@@ -595,7 +595,7 @@ export async function workflowRunCommand(
   let result: Awaited<ReturnType<typeof executeWorkflow>>;
   try {
     result = await executeWorkflow(
-      createWorkflowDeps(),
+      await createWorkflowDeps(),
       adapter,
       conversationId,
       workingCwd,

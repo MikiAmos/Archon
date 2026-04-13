@@ -340,7 +340,7 @@ export async function dispatchBackgroundWorkflow(
   // 7. Pre-create workflow run row so the UI can fetch it immediately.
   // Without this, navigating to the execution page before executeWorkflow's
   // async setup completes would 404 (row doesn't exist yet for 1-5 seconds).
-  const workflowDeps = createWorkflowDeps();
+  const workflowDeps = await createWorkflowDeps();
   let preCreatedRun: Awaited<ReturnType<typeof workflowDeps.store.createWorkflowRun>> | undefined;
   try {
     preCreatedRun = await workflowDeps.store.createWorkflowRun({

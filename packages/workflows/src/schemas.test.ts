@@ -8,6 +8,7 @@ import {
   SCRIPT_NODE_AI_FIELDS,
   approvalOnRejectSchema,
   dagNodeSchema,
+  workflowDefinitionSchema,
 } from './schemas';
 import type {
   WorkflowDefinition,
@@ -659,5 +660,46 @@ describe('SCRIPT_NODE_AI_FIELDS', () => {
     for (const field of expectedFields) {
       expect(SCRIPT_NODE_AI_FIELDS).toContain(field);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// mcp_servers schema field
+// ---------------------------------------------------------------------------
+
+describe('mcp_servers schema field', () => {
+  const baseWorkflow = {
+    name: 'test',
+    description: 'test',
+    nodes: [{ id: 'a', prompt: 'do something' }],
+  };
+
+  test('accepts mcp_servers with include', () => {
+    const result = workflowDefinitionSchema.safeParse({
+      ...baseWorkflow,
+      mcp_servers: { include: ['linear'] },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  test('accepts mcp_servers with exclude', () => {
+    const result = workflowDefinitionSchema.safeParse({
+      ...baseWorkflow,
+      mcp_servers: { exclude: ['context-mode'] },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  test('rejects mcp_servers with both include and exclude', () => {
+    const result = workflowDefinitionSchema.safeParse({
+      ...baseWorkflow,
+      mcp_servers: { include: ['linear'], exclude: ['supabase'] },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  test('accepts workflow with no mcp_servers field', () => {
+    const result = workflowDefinitionSchema.safeParse(baseWorkflow);
+    expect(result.success).toBe(true);
   });
 });

@@ -274,4 +274,11 @@ export interface WorkflowDeps {
   store: IWorkflowStore;
   getAssistantClient: AssistantClientFactory;
   loadConfig: (cwd: string) => Promise<WorkflowConfig>;
+  /** User-level MCP servers discovered at startup. Cached — not re-scanned per run. */
+  mcpServers?: Record<
+    string,
+    | { type?: 'stdio'; command: string; args?: string[]; env?: Record<string, string> }
+    | { type: 'sse'; url: string; headers?: Record<string, string> }
+    | { type: 'http'; url: string; headers?: Record<string, string> }
+  >;
 }

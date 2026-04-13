@@ -5,7 +5,9 @@
 import type { IWorkflowStore } from '@archon/workflows/store';
 import type { WorkflowConfig, WorkflowDeps } from '@archon/workflows/deps';
 import type { WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
+import type { McpServerMap } from '@archon/workflows/mcp/mcp-utils';
 import type { MergedConfig } from '../config/config-types';
+import { discoverUserMcpServers } from '../mcp/discovery';
 import * as workflowDb from '../db/workflows';
 import * as workflowEventDb from '../db/workflow-events';
 import * as codebaseDb from '../db/codebases';
@@ -62,14 +64,31 @@ export function createWorkflowStore(): IWorkflowStore {
   };
 }
 
+// Singleton discovery — runs once per process, result reused.
+let discoveredMcpServers: McpServerMap | undefined;
+async function discoverOnce(): Promise<McpServerMap> {
+  if (!discoveredMcpServers) {
+    discoveredMcpServers = await discoverUserMcpServers();
+  }
+  return discoveredMcpServers;
+}
+
+/** Reset discovery cache — for testing only. */
+export function resetMcpDiscoveryCache(): void {
+  discoveredMcpServers = undefined;
+}
+
 /**
  * Create the canonical WorkflowDeps for the workflow engine.
  * Single construction point — avoids duplicating the wiring across callers.
+ * @param mcpServers — optional override for testing (skips user plugin discovery)
  */
-export function createWorkflowDeps(): WorkflowDeps {
+export async function createWorkflowDeps(mcpServers?: McpServerMap): Promise<WorkflowDeps> {
+  const servers = mcpServers ?? (await discoverOnce());
   return {
     store: createWorkflowStore(),
     getAssistantClient,
     loadConfig: loadMergedConfig,
+    mcpServers: Object.keys(servers).length > 0 ? servers : undefined,
   };
 }

@@ -26,6 +26,15 @@ export type WebSearchMode = z.infer<typeof webSearchModeSchema>;
 // WorkflowBase — common fields shared by all workflow types
 // ---------------------------------------------------------------------------
 
+const mcpServersFilterSchema = z
+  .object({
+    include: z.array(z.string().min(1)).optional(),
+    exclude: z.array(z.string().min(1)).optional(),
+  })
+  .refine(data => !(data.include && data.exclude), {
+    message: "mcp_servers 'include' and 'exclude' are mutually exclusive",
+  });
+
 export const workflowBaseSchema = z.object({
   name: z.string().min(1),
   description: z.string().min(1),
@@ -40,6 +49,7 @@ export const workflowBaseSchema = z.object({
   fallbackModel: z.string().min(1).optional(),
   betas: z.array(z.string().min(1)).nonempty("'betas' must be a non-empty array").optional(),
   sandbox: sandboxSettingsSchema.optional(),
+  mcp_servers: mcpServersFilterSchema.optional(),
 });
 
 export type WorkflowBase = z.infer<typeof workflowBaseSchema>;

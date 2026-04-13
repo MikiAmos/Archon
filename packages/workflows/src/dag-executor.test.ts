@@ -5210,3 +5210,230 @@ describe('executeDagWorkflow -- script nodes', () => {
     expect(notFoundMsg).toBeDefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Workflow-level MCP server injection (#task-7)
+// ---------------------------------------------------------------------------
+
+describe('workflow-level MCP server injection', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-mcp-inject-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const commandsDir = join(testDir, '.archon', 'commands');
+    await mkdir(commandsDir, { recursive: true });
+    await writeFile(join(commandsDir, 'my-cmd.md'), 'My command prompt for $USER_MESSAGE');
+
+    mockSendQueryDag.mockClear();
+    mockGetAssistantClientDag.mockClear();
+
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'DAG AI response' };
+      yield { type: 'result', sessionId: 'dag-session-id' };
+    });
+  });
+
+  afterEach(async () => {
+    mockGetAssistantClientDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+    }));
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  it('workflow-level MCP servers injected when no per-node mcp', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    const workflowMcpServers = {
+      linear: { type: 'http', url: 'https://linear.example.com/mcp' },
+    };
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      { name: 'dag-mcp-inject', nodes: [{ id: 'review', command: 'my-cmd' }] },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined, // configuredCommandFolder
+      undefined, // issueContext
+      undefined, // priorCompletedNodes
+      workflowMcpServers
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    // mcpServers should contain the workflow-level server
+    const mcpServers = optionsArg?.mcpServers as Record<string, unknown>;
+    expect(mcpServers).toBeDefined();
+    expect(mcpServers['linear']).toEqual({ type: 'http', url: 'https://linear.example.com/mcp' });
+    // allowedTools should contain the wildcard
+    const allowedTools = optionsArg?.allowedTools as string[];
+    expect(allowedTools).toContain('mcp__linear__*');
+  });
+
+  it('per-node mcp: overrides workflow-level on name collision', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    // Write per-node MCP config with same server name but different URL
+    const mcpConfigPath = join(testDir, 'node-mcp.json');
+    await writeFile(
+      mcpConfigPath,
+      JSON.stringify({ linear: { type: 'http', url: 'https://linear-override.example.com/mcp' } })
+    );
+
+    const workflowMcpServers = {
+      linear: { type: 'http', url: 'https://linear-old.example.com/mcp' },
+    };
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'dag-mcp-override',
+        nodes: [{ id: 'review', command: 'my-cmd', mcp: 'node-mcp.json' }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      workflowMcpServers
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    const mcpServers = optionsArg?.mcpServers as Record<string, unknown>;
+    expect(mcpServers).toBeDefined();
+    // Node-level config wins on name collision
+    expect(mcpServers['linear']).toEqual({
+      type: 'http',
+      url: 'https://linear-override.example.com/mcp',
+    });
+    // Only one wildcard for the merged server name
+    const allowedTools = optionsArg?.allowedTools as string[];
+    expect(allowedTools).toContain('mcp__linear__*');
+  });
+
+  it('both workflow-level and per-node servers merged when no collision', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    // Write per-node MCP config with a DIFFERENT server name
+    const mcpConfigPath = join(testDir, 'node-mcp.json');
+    await writeFile(
+      mcpConfigPath,
+      JSON.stringify({ supabase: { type: 'http', url: 'https://supabase.example.com/mcp' } })
+    );
+
+    const workflowMcpServers = {
+      linear: { type: 'http', url: 'https://linear.example.com/mcp' },
+    };
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'dag-mcp-merge',
+        nodes: [{ id: 'review', command: 'my-cmd', mcp: 'node-mcp.json' }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      workflowMcpServers
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    const mcpServers = optionsArg?.mcpServers as Record<string, unknown>;
+    expect(mcpServers).toBeDefined();
+    // Both servers present
+    expect(mcpServers['linear']).toEqual({ type: 'http', url: 'https://linear.example.com/mcp' });
+    expect(mcpServers['supabase']).toEqual({
+      type: 'http',
+      url: 'https://supabase.example.com/mcp',
+    });
+    // Wildcards for both
+    const allowedTools = optionsArg?.allowedTools as string[];
+    expect(allowedTools).toContain('mcp__linear__*');
+    expect(allowedTools).toContain('mcp__supabase__*');
+  });
+
+  it('nodes without per-node mcp: get workflow-level servers', async () => {
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    const workflowMcpServers = {
+      github: { type: 'http', url: 'https://github.example.com/mcp' },
+      sentry: { type: 'http', url: 'https://sentry.example.com/mcp' },
+    };
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'dag-mcp-passthrough',
+        nodes: [{ id: 'review', command: 'my-cmd' }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      workflowMcpServers
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    const mcpServers = optionsArg?.mcpServers as Record<string, unknown>;
+    expect(mcpServers).toBeDefined();
+    expect(mcpServers['github']).toEqual({ type: 'http', url: 'https://github.example.com/mcp' });
+    expect(mcpServers['sentry']).toEqual({ type: 'http', url: 'https://sentry.example.com/mcp' });
+    const allowedTools = optionsArg?.allowedTools as string[];
+    expect(allowedTools).toContain('mcp__github__*');
+    expect(allowedTools).toContain('mcp__sentry__*');
+  });
+});

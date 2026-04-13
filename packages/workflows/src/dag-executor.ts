@@ -67,6 +67,7 @@ import {
   stripCompletionTags,
   isInlineScript,
 } from './executor-shared';
+import type { McpServerMap } from './mcp/mcp-utils';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -369,7 +370,8 @@ async function resolveNodeProviderAndModel(
   conversationId: string,
   workflowRunId: string,
   cwd: string,
-  workflowLevelOptions: WorkflowLevelOptions
+  workflowLevelOptions: WorkflowLevelOptions,
+  workflowMcpServers?: McpServerMap
 ): Promise<{
   provider: 'claude' | 'codex';
   model: string | undefined;
@@ -407,7 +409,7 @@ async function resolveNodeProviderAndModel(
       platform,
       conversationId,
       `Warning: Node '${node.id}' has allowed_tools/denied_tools set but uses Codex — per-node tool restrictions are not supported for Codex. Configure MCP servers globally in the Codex CLI config instead.`,
-      { workflowId: workflowRunId, nodeName: node.id }
+      { workflowId: workflowRunId, nodeName: node.name ?? node.id }
     );
     if (!delivered) {
       getLog().error({ nodeId: node.id, workflowRunId }, 'dag_node_codex_warning_delivery_failed');
@@ -421,7 +423,7 @@ async function resolveNodeProviderAndModel(
       platform,
       conversationId,
       `Warning: Node '${node.id}' has hooks set but uses Codex provider — hooks are Claude-only and will be ignored.`,
-      { workflowId: workflowRunId, nodeName: node.id }
+      { workflowId: workflowRunId, nodeName: node.name ?? node.id }
     );
     if (!delivered) {
       getLog().error({ nodeId: node.id, workflowRunId }, 'dag_node_hooks_warning_delivery_failed');
@@ -435,7 +437,7 @@ async function resolveNodeProviderAndModel(
       platform,
       conversationId,
       `Warning: Node '${node.id}' has mcp config but uses Codex — per-node MCP servers are not supported for Codex. Configure MCP servers globally in the Codex CLI config instead.`,
-      { workflowId: workflowRunId, nodeName: node.id }
+      { workflowId: workflowRunId, nodeName: node.name ?? node.id }
     );
     if (!delivered) {
       getLog().error({ nodeId: node.id, workflowRunId }, 'dag.mcp_warning_delivery_failed');
@@ -449,7 +451,7 @@ async function resolveNodeProviderAndModel(
       platform,
       conversationId,
       `Warning: Node '${node.id}' has skills set but uses Codex — per-node skills are not supported for Codex.`,
-      { workflowId: workflowRunId, nodeName: node.id }
+      { workflowId: workflowRunId, nodeName: node.name ?? node.id }
     );
     if (!delivered) {
       getLog().error({ nodeId: node.id, workflowRunId }, 'dag.skills_warning_delivery_failed');
@@ -474,7 +476,7 @@ async function resolveNodeProviderAndModel(
         platform,
         conversationId,
         `Warning: Node '${node.id}' has Claude-only options (${present.join(', ')}) but uses Codex — these will be ignored.`,
-        { workflowId: workflowRunId, nodeName: node.id }
+        { workflowId: workflowRunId, nodeName: node.name ?? node.id }
       );
       if (!delivered) {
         getLog().error(
@@ -515,49 +517,79 @@ async function resolveNodeProviderAndModel(
       const builtHooks = buildSDKHooksFromYAML(node.hooks);
       if (Object.keys(builtHooks).length > 0) claudeOptions.hooks = builtHooks;
     }
-    // Load MCP config if specified
-    if (node.mcp) {
+    // MCP server injection — workflow-level (from discovery) + per-node (from mcp: field)
+    if (workflowMcpServers && Object.keys(workflowMcpServers).length > 0) {
+      const mergedMcp: McpServerMap = { ...workflowMcpServers };
+
+      if (node.mcp) {
+        // Per-node mcp: file overrides workflow-level on name collision
+        try {
+          const { servers, missingVars } = await loadMcpConfig(node.mcp, cwd);
+          Object.assign(mergedMcp, servers as McpServerMap); // node wins
+          if (missingVars.length > 0) {
+            const uniqueVars = [...new Set(missingVars)];
+            getLog().warn({ nodeId: node.id, missingVars: uniqueVars }, 'dag.mcp_env_vars_missing');
+            await safeSendMessage(
+              platform,
+              conversationId,
+              `Warning: Node '${node.id}' MCP config references undefined env vars: ${uniqueVars.join(', ')}. These will be empty strings — MCP servers may fail to authenticate.`,
+              { workflowId: workflowRunId, nodeName: node.name ?? node.id }
+            );
+          }
+        } catch (mcpErr) {
+          const errMsg = (mcpErr as Error).message;
+          getLog().error(
+            { nodeId: node.id, mcpPath: node.mcp, error: errMsg },
+            'dag.mcp_config_load_failed'
+          );
+          throw new Error(`Node '${node.id}': ${errMsg}`);
+        }
+      }
+
+      claudeOptions.mcpServers = mergedMcp;
+      const mcpWildcards = Object.keys(mergedMcp).map(name => `mcp__${name}__*`);
+      claudeOptions.allowedTools = [...(claudeOptions.allowedTools ?? []), ...mcpWildcards];
+      getLog().info(
+        { nodeId: node.id, serverNames: Object.keys(mergedMcp), hasNodeMcp: !!node.mcp },
+        'dag.mcp_servers_injected'
+      );
+
+      // Warn if Haiku model is used with MCP
+      if (model?.toLowerCase().includes('haiku')) {
+        getLog().warn({ nodeId: node.id, model }, 'dag.mcp_haiku_tool_search_unsupported');
+        await safeSendMessage(
+          platform,
+          conversationId,
+          `Warning: Node '${node.id}' uses Haiku model with MCP servers — tool search (lazy loading for many tools) is not supported on Haiku. Consider using Sonnet or Opus.`,
+          { workflowId: workflowRunId, nodeName: node.name ?? node.id }
+        );
+      }
+    } else if (node.mcp) {
+      // No workflow-level MCP — existing per-node handling
       try {
         const { servers, serverNames, missingVars } = await loadMcpConfig(node.mcp, cwd);
-        // loadMcpConfig returns Record<string, unknown> from JSON; cast to the structural
-        // union type — the SDK validates server configs at connection time
         claudeOptions.mcpServers = servers as unknown as WorkflowAssistantOptions['mcpServers'];
-        // Auto-allow all MCP tools via wildcards
         const mcpWildcards = serverNames.map(name => `mcp__${name}__*`);
         claudeOptions.allowedTools = [...(claudeOptions.allowedTools ?? []), ...mcpWildcards];
         getLog().info({ nodeId: node.id, serverNames, mcpPath: node.mcp }, 'dag.mcp_config_loaded');
-        // Warn user about missing env vars (likely secrets that will cause auth failures)
         if (missingVars.length > 0) {
           const uniqueVars = [...new Set(missingVars)];
           getLog().warn({ nodeId: node.id, missingVars: uniqueVars }, 'dag.mcp_env_vars_missing');
-          const delivered = await safeSendMessage(
+          await safeSendMessage(
             platform,
             conversationId,
             `Warning: Node '${node.id}' MCP config references undefined env vars: ${uniqueVars.join(', ')}. These will be empty strings — MCP servers may fail to authenticate.`,
-            { workflowId: workflowRunId, nodeName: node.id }
+            { workflowId: workflowRunId, nodeName: node.name ?? node.id }
           );
-          if (!delivered) {
-            getLog().error(
-              { nodeId: node.id, workflowRunId },
-              'dag.mcp_env_vars_warning_delivery_failed'
-            );
-          }
         }
-        // Warn if Haiku model is used with MCP (tool search not supported)
         if (model?.toLowerCase().includes('haiku')) {
           getLog().warn({ nodeId: node.id, model }, 'dag.mcp_haiku_tool_search_unsupported');
-          const haikuDelivered = await safeSendMessage(
+          await safeSendMessage(
             platform,
             conversationId,
-            `Warning: Node '${node.id}' uses Haiku model with MCP servers — tool search (lazy loading for many tools) is not supported on Haiku. Consider using Sonnet or Opus.`,
-            { workflowId: workflowRunId, nodeName: node.id }
+            `Warning: Node '${node.id}' uses Haiku model with MCP servers — tool search is not supported on Haiku.`,
+            { workflowId: workflowRunId, nodeName: node.name ?? node.id }
           );
-          if (!haikuDelivered) {
-            getLog().error(
-              { nodeId: node.id, workflowRunId },
-              'dag.mcp_haiku_warning_delivery_failed'
-            );
-          }
         }
       } catch (mcpErr) {
         const errMsg = (mcpErr as Error).message;
@@ -728,7 +760,10 @@ async function executeNodeInternal(
   issueContext?: string
 ): Promise<NodeExecutionResult> {
   const nodeStartTime = Date.now();
-  const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
+  const nodeContext: SendMessageContext = {
+    workflowId: workflowRun.id,
+    nodeName: node.name ?? node.id,
+  };
 
   getLog().info({ nodeId: node.id, provider }, 'dag_node_started');
   await logNodeStart(logDir, workflowRun.id, node.id, node.command ?? '<inline>');
@@ -752,7 +787,7 @@ async function executeNodeInternal(
     type: 'node_started',
     runId: workflowRun.id,
     nodeId: node.id,
-    nodeName: node.command ?? node.id,
+    nodeName: node.name ?? node.command ?? node.id,
   });
 
   // Load prompt
@@ -780,7 +815,7 @@ async function executeNodeInternal(
         type: 'node_failed',
         runId: workflowRun.id,
         nodeId: node.id,
-        nodeName: node.command,
+        nodeName: node.name ?? node.command,
         error: errMsg,
       });
       return { state: 'failed', output: '', error: errMsg };
@@ -1143,7 +1178,7 @@ async function executeNodeInternal(
         type: 'node_failed',
         runId: workflowRun.id,
         nodeId: node.id,
-        nodeName: node.command ?? node.id,
+        nodeName: node.name ?? node.command ?? node.id,
         error: 'Cancelled by user',
       });
 
@@ -1188,7 +1223,7 @@ async function executeNodeInternal(
         type: 'node_failed',
         runId: workflowRun.id,
         nodeId: node.id,
-        nodeName: node.command ?? node.id,
+        nodeName: node.name ?? node.command ?? node.id,
         error: creditError,
       });
 
@@ -1230,7 +1265,7 @@ async function executeNodeInternal(
       type: 'node_completed',
       runId: workflowRun.id,
       nodeId: node.id,
-      nodeName: node.command ?? node.id,
+      nodeName: node.name ?? node.command ?? node.id,
       duration,
       ...(nodeCostUsd !== undefined ? { costUsd: nodeCostUsd } : {}),
       ...(nodeStopReason ? { stopReason: nodeStopReason } : {}),
@@ -1286,7 +1321,7 @@ async function executeNodeInternal(
       type: 'node_failed',
       runId: workflowRun.id,
       nodeId: node.id,
-      nodeName: node.command ?? node.id,
+      nodeName: node.name ?? node.command ?? node.id,
       error: err.message,
     });
 
@@ -1317,7 +1352,10 @@ async function executeBashNode(
   issueContext?: string
 ): Promise<NodeOutput> {
   const nodeStartTime = Date.now();
-  const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
+  const nodeContext: SendMessageContext = {
+    workflowId: workflowRun.id,
+    nodeName: node.name ?? node.id,
+  };
 
   getLog().info({ nodeId: node.id, type: 'bash' }, 'dag_node_started');
   await logNodeStart(logDir, workflowRun.id, node.id, '<bash>');
@@ -1341,7 +1379,7 @@ async function executeBashNode(
     type: 'node_started',
     runId: workflowRun.id,
     nodeId: node.id,
-    nodeName: node.id,
+    nodeName: node.name ?? node.id,
   });
 
   // Variable substitution on script
@@ -1399,7 +1437,7 @@ async function executeBashNode(
       type: 'node_completed',
       runId: workflowRun.id,
       nodeId: node.id,
-      nodeName: node.id,
+      nodeName: node.name ?? node.id,
       duration,
     });
 
@@ -1439,7 +1477,7 @@ async function executeBashNode(
       type: 'node_failed',
       runId: workflowRun.id,
       nodeId: node.id,
-      nodeName: node.id,
+      nodeName: node.name ?? node.id,
       error: errorMsg,
     });
 
@@ -1467,7 +1505,10 @@ async function executeScriptNode(
   issueContext?: string
 ): Promise<NodeOutput> {
   const nodeStartTime = Date.now();
-  const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
+  const nodeContext: SendMessageContext = {
+    workflowId: workflowRun.id,
+    nodeName: node.name ?? node.id,
+  };
 
   getLog().info({ nodeId: node.id, type: 'script', runtime: node.runtime }, 'dag_node_started');
   await logNodeStart(logDir, workflowRun.id, node.id, '<script>');
@@ -1491,7 +1532,7 @@ async function executeScriptNode(
     type: 'node_started',
     runId: workflowRun.id,
     nodeId: node.id,
-    nodeName: node.id,
+    nodeName: node.name ?? node.id,
   });
 
   // Variable substitution on script field
@@ -1542,7 +1583,7 @@ async function executeScriptNode(
           type: 'node_failed',
           runId: workflowRun.id,
           nodeId: node.id,
-          nodeName: node.id,
+          nodeName: node.name ?? node.id,
           error: errorMsg,
         });
         deps.store
@@ -1613,7 +1654,7 @@ async function executeScriptNode(
       type: 'node_completed',
       runId: workflowRun.id,
       nodeId: node.id,
-      nodeName: node.id,
+      nodeName: node.name ?? node.id,
       duration,
     });
 
@@ -1654,7 +1695,7 @@ async function executeScriptNode(
       type: 'node_failed',
       runId: workflowRun.id,
       nodeId: node.id,
-      nodeName: node.id,
+      nodeName: node.name ?? node.id,
       error: errorMsg,
     });
 
@@ -1715,7 +1756,7 @@ async function executeLoopNode(
   issueContext?: string
 ): Promise<NodeExecutionResult> {
   const loop = node.loop;
-  const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
+  const msgContext = { workflowId: workflowRun.id, nodeName: node.name ?? node.id };
 
   // Resolve AI client — fail fast with descriptive error
   let aiClient: ReturnType<typeof deps.getAssistantClient>;
@@ -2098,7 +2139,7 @@ async function executeLoopNode(
         type: 'node_completed',
         runId: workflowRun.id,
         nodeId: node.id,
-        nodeName: node.id,
+        nodeName: node.name ?? node.id,
         duration: Date.now() - iterationStart,
         ...(loopTotalCostUsd !== undefined ? { costUsd: loopTotalCostUsd } : {}),
         ...(loopFinalStopReason ? { stopReason: loopFinalStopReason } : {}),
@@ -2122,7 +2163,7 @@ async function executeLoopNode(
         `Respond: \`/workflow approve ${workflowRun.id} <your feedback>\` | Cancel: \`/workflow reject ${workflowRun.id}\``;
       const gateSent = await safeSendMessage(platform, conversationId, gateMsg, {
         workflowId: workflowRun.id,
-        nodeName: node.id,
+        nodeName: node.name ?? node.id,
       });
       if (!gateSent) {
         // Gate message failed to deliver — do not pause; fail the node so the user
@@ -2205,9 +2246,10 @@ async function executeApprovalNode(
   config: WorkflowConfig,
   workflowLevelOptions: WorkflowLevelOptions,
   configuredCommandFolder?: string,
-  issueContext?: string
+  issueContext?: string,
+  workflowMcpServers?: McpServerMap
 ): Promise<NodeOutput> {
-  const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
+  const msgContext = { workflowId: workflowRun.id, nodeName: node.name ?? node.id };
 
   // Detect rejection resume — check metadata for rejection_reason set by reject handlers
   const rawApproval = workflowRun.metadata?.approval;
@@ -2283,7 +2325,8 @@ async function executeApprovalNode(
       conversationId,
       workflowRun.id,
       cwd,
-      workflowLevelOptions
+      workflowLevelOptions,
+      workflowMcpServers
     );
 
     const output = await executeNodeInternal(
@@ -2373,7 +2416,8 @@ export async function executeDagWorkflow(
   config: WorkflowConfig,
   configuredCommandFolder?: string,
   issueContext?: string,
-  priorCompletedNodes?: Map<string, string>
+  priorCompletedNodes?: Map<string, string>,
+  workflowMcpServers?: McpServerMap
 ): Promise<string | undefined> {
   const dagStartTime = Date.now();
   const workflowLevelOptions = {
@@ -2454,7 +2498,7 @@ export async function executeDagWorkflow(
               type: 'node_skipped',
               runId: workflowRun.id,
               nodeId: node.id,
-              nodeName: node.command ?? node.id,
+              nodeName: node.name ?? node.command ?? node.id,
               reason: 'prior_success',
             });
             // Return the pre-populated output (already in nodeOutputs)
@@ -2491,7 +2535,7 @@ export async function executeDagWorkflow(
               type: 'node_skipped',
               runId: workflowRun.id,
               nodeId: node.id,
-              nodeName: node.command ?? node.id,
+              nodeName: node.name ?? node.command ?? node.id,
               reason: 'trigger_rule',
             });
             return { nodeId: node.id, output: { state: 'skipped' as const, output: '' } };
@@ -2507,7 +2551,7 @@ export async function executeDagWorkflow(
               const parseErrMsg = `\u26a0\ufe0f Node '${node.id}': unparseable \`when:\` expression "${node.when}" \u2014 node skipped (fail-closed). Check syntax: \`$nodeId.output == 'VALUE'\`, \`$nodeId.output > '5'\`, or compound \`$a.output == 'X' && $b.output != 'Y'\`.`;
               await safeSendMessage(platform, conversationId, parseErrMsg, {
                 workflowId: workflowRun.id,
-                nodeName: node.id,
+                nodeName: node.name ?? node.id,
               });
               getLog().error(
                 { nodeId: node.id, when: node.when },
@@ -2539,7 +2583,7 @@ export async function executeDagWorkflow(
                 type: 'node_skipped',
                 runId: workflowRun.id,
                 nodeId: node.id,
-                nodeName: node.command ?? node.id,
+                nodeName: node.name ?? node.command ?? node.id,
                 reason: 'when_condition_parse_error',
               });
               return { nodeId: node.id, output: { state: 'skipped' as const, output: '' } };
@@ -2569,7 +2613,7 @@ export async function executeDagWorkflow(
                 type: 'node_skipped',
                 runId: workflowRun.id,
                 nodeId: node.id,
-                nodeName: node.command ?? node.id,
+                nodeName: node.name ?? node.command ?? node.id,
                 reason: 'when_condition',
               });
               return {
@@ -2667,7 +2711,8 @@ export async function executeDagWorkflow(
               config,
               workflowLevelOptions,
               configuredCommandFolder,
-              issueContext
+              issueContext,
+              workflowMcpServers
             );
             return { nodeId: node.id, output };
           }
@@ -2678,7 +2723,7 @@ export async function executeDagWorkflow(
             const cancelMsg = `\u274c **Workflow cancelled** (node \`${node.id}\`): ${reason}`;
             await safeSendMessage(platform, conversationId, cancelMsg, {
               workflowId: workflowRun.id,
-              nodeName: node.id,
+              nodeName: node.name ?? node.id,
             });
             deps.store
               .createWorkflowEvent({
@@ -2733,7 +2778,8 @@ export async function executeDagWorkflow(
             conversationId,
             workflowRun.id,
             cwd,
-            workflowLevelOptions
+            workflowLevelOptions,
+            workflowMcpServers
           );
 
           // 5. Determine session — parallel or context:fresh → always fresh
@@ -2804,7 +2850,7 @@ export async function executeDagWorkflow(
               platform,
               conversationId,
               `⚠️ Node \`${node.id}\` failed with ${errorKind} (attempt ${String(attempt + 1)}/${String(retryConfig.maxRetries + 1)}). Retrying in ${String(Math.round(delayMs / 1000))}s...`,
-              { workflowId: workflowRun.id, nodeName: node.id }
+              { workflowId: workflowRun.id, nodeName: node.name ?? node.id }
             );
 
             await new Promise(resolve => setTimeout(resolve, delayMs));
@@ -2828,14 +2874,14 @@ export async function executeDagWorkflow(
             type: 'node_failed',
             runId: workflowRun.id,
             nodeId: node.id,
-            nodeName: node.command ?? node.id,
+            nodeName: node.name ?? node.command ?? node.id,
             error: err.message,
           });
           await safeSendMessage(
             platform,
             conversationId,
             `Node '${node.id}' failed before execution: ${err.message}`,
-            { workflowId: workflowRun.id, nodeName: node.id }
+            { workflowId: workflowRun.id, nodeName: node.name ?? node.id }
           );
           return {
             nodeId: node.id,
