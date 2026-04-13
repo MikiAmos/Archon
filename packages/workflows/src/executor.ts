@@ -634,13 +634,15 @@ export async function executeWorkflow(
     }
 
     // Filter per workflow-level mcp_servers: { include?, exclude? }
+    // When workflow doesn't specify mcp_servers, default to empty — don't leak all
+    // discovered servers (they'll fail without proper auth/config in workflow context).
     const filteredMcpServers = workflow.mcp_servers
       ? filterMcpServers(
           mergedMcpServers,
           workflow.mcp_servers.include,
           workflow.mcp_servers.exclude
         )
-      : mergedMcpServers;
+      : {};
 
     // Execute the DAG workflow
     const dagSummary = await executeDagWorkflow(

@@ -2229,6 +2229,51 @@ export function registerApiRoutes(
         }
       }
 
+      // 1.5. Try other registered codebases — custom workflows may live in a
+      // different project (e.g., Archon repo) when running against another codebase.
+      const allCodebases = await codebaseDb.listCodebases();
+      for (const cb of allCodebases) {
+        if (cb.default_cwd === workingDir) continue; // already searched above
+        const [workflowFolder] = getWorkflowFolderSearchPaths();
+        const otherFilePath = join(cb.default_cwd, workflowFolder, filename);
+        try {
+          const content = await readFile(otherFilePath, 'utf-8');
+          const result = parseWorkflow(content, filename);
+          if (result.error) continue; // skip invalid, keep searching
+          return c.json({
+            workflow: result.workflow,
+            filename,
+            source: 'project' as WorkflowSource,
+          });
+        } catch {
+          // ENOENT or other — continue searching
+        }
+      }
+
+      // 1.6. Try global workflows (~/.archon/.archon/workflows/)
+      const globalHome = getArchonHome();
+      {
+        const [workflowFolder] = getWorkflowFolderSearchPaths();
+        const globalFilePath = join(globalHome, workflowFolder, filename);
+        try {
+          const content = await readFile(globalFilePath, 'utf-8');
+          const result = parseWorkflow(content, filename);
+          if (result.error) {
+            return apiError(c, 500, `Workflow file is invalid: ${result.error.error}`);
+          }
+          return c.json({
+            workflow: result.workflow,
+            filename,
+            source: 'project' as WorkflowSource,
+          });
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+            getLog().error({ err, name }, 'workflow.fetch_global_failed');
+            return apiError(c, 500, 'Failed to read workflow');
+          }
+        }
+      }
+
       // 2. Fall back to bundled defaults (binary: embedded map; dev: also check filesystem)
       if (Object.hasOwn(BUNDLED_WORKFLOWS, name)) {
         const bundledContent = BUNDLED_WORKFLOWS[name];
